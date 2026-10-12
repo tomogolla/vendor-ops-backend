@@ -1,0 +1,165 @@
+from rest_framework import serializers
+
+from accounts.models import User
+from accounts.serializers import UserSummarySerializer
+from tasks.models import Task
+
+from .models import ActivityEvent, Application, InternalNote, Vendor
+from .services import MatchResult
+
+VENDOR_EDITABLE_FIELDS = [
+    'brand_name', 'first_name', 'last_name', 'email', 'phone', 'instagram', 'website',
+    'category', 'description', 'objectives', 'commitment_level', 'other_markets',
+    'business_registration', 'liability_insurance', 'lead_source', 'source_details', 'tags', 'notes',
+]
+ADMIN_ONLY_VENDOR_FIELDS = {'owner', 'is_active', 'outreach_opt_out'}
+
+
+class CallSummarySerializer(serializers.Serializer):
+    """Latest discovery-call state, computed from the prefetched `discovery_calls`."""
+
+    def to_representation(self, vendor):
+        calls = getattr(vendor, 'discovery_calls', None)
+        if calls is None:
+            calls = list(vendor.tasks.filter(task_type=Task.TaskType.DISCOVERY_CALL).order_by('-created_at'))
+        open_task = next((task for task in calls if task.is_open), None)
+        attempted = [task for task in calls if task.attempt_count]
+        latest = max(attempted, key=lambda task: task.last_attempt_at) if attempted else None
+        return {
+            'open_task_id': str(open_task.pk) if open_task else None,
+            'open_task_status': open_task.status if open_task else None,
+            'due_at': open_task.due_at if open_task else None,
+            'owner_id': str(open_task.owner_id) if open_task and open_task.owner_id else None,
+            'never_called': not attempted,
+            'last_outcome': latest.outcome if latest else '',
+            'last_called_at': latest.last_attempt_at if latest else None,
+            'attempt_count': (open_task or latest).attempt_count if (open_task or latest) else 0,
+            'call_details': latest.call_details if latest else {},
+        }
+
+
+class VendorSerializer(serializers.ModelSerializer):
+    status = serializers.CharField(source='display_status', read_only=True)
+    owner = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True), allow_null=True, required=False
+    )
+    owner_detail = UserSummarySerializer(source='owner', read_only=True)
+    created_by = UserSummarySerializer(read_only=True)
+    call = CallSummarySerializer(source='*', read_only=True)
+    tags = serializers.ListField(child=serializers.CharField(max_length=50), required=False)
+
+    class Meta:
+        model = Vendor
+        fields = [
+            'id', 'created_at', 'updated_at', 'created_by', 'owner', 'owner_detail',
+            *VENDOR_EDITABLE_FIELDS,
+            'journey_stage', 'qualification_status', 'application_status_summary',
+            'is_active', 'outreach_opt_out', 'status', 'call',
+        ]
+        read_only_fields = [
+            'id', 'created_at', 'updated_at', 'journey_stage', 'qualification_status', 'application_status_summary',
+        ]
+        extra_kwargs = {'brand_name': {'allow_blank': False}}
+
+    def validate(self, attrs):
+        user = self.context['request'].user
+        if not getattr(user, 'is_administrator', False):
+            changed = {
+                key for key in ADMIN_ONLY_VENDOR_FIELDS & attrs.keys()
+                if self.instance is None or getattr(self.instance, key) != attrs[key]
+            }
+            # Team members may set themselves as owner when creating a lead.
+            if self.instance is None and attrs.get('owner') in (None, user):
+                changed.discard('owner')
+            if changed:
+                raise serializers.ValidationError(
+                    {key: 'Only administrators can change this.' for key in sorted(changed)}
+                )
+        brand = attrs.get('brand_name', getattr(self.instance, 'brand_name', ''))
+        email = attrs.get('email', getattr(self.instance, 'email', ''))
+        phone = attrs.get('phone', getattr(self.instance, 'phone', ''))
+        instagram = attrs.get('instagram', getattr(self.instance, 'instagram', ''))
+        if not brand.strip():
+            raise serializers.ValidationError({'brand_name': 'Brand name is required.'})
+        if not (email or phone or instagram):
+            raise serializers.ValidationError({'contact': 'Add at least one of email, phone or Instagram.'})
+        return attrs
+
+
+class VendorSummarySerializer(serializers.ModelSerializer):
+    status = serializers.CharField(source='display_status', read_only=True)
+
+    class Meta:
+        model = Vendor
+        fields = ['id', 'brand_name', 'first_name', 'last_name', 'email', 'phone', 'instagram', 'status']
+
+
+def match_payload(result: MatchResult) -> dict:
+    return {
+        'matches': [
+            {'vendor': VendorSummarySerializer(m.vendor).data, 'matched_on': m.matched_on} for m in result.reliable
+        ],
+        'name_matches': VendorSummarySerializer(result.name_only, many=True).data,
+    }
+
+
+class VendorStatusChangeSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=['lead', 'applied', 'in_review', 'waitlisted', 'approved', 'declined', 'suspended'])
+    note = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class QualificationChangeSerializer(serializers.Serializer):
+    qualification_status = serializers.ChoiceField(choices=Vendor.Qualification.choices)
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class ApplicationSerializer(serializers.ModelSerializer):
+    vendor = serializers.PrimaryKeyRelatedField(queryset=Vendor.objects.all(), required=False)
+    vendor_detail = VendorSummarySerializer(source='vendor', read_only=True)
+    vendor_data = serializers.DictField(write_only=True, required=False)
+    reviewer = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True), allow_null=True, required=False
+    )
+    submitted_by = UserSummarySerializer(read_only=True)
+
+    class Meta:
+        model = Application
+        fields = [
+            'id', 'vendor', 'vendor_detail', 'vendor_data', 'submitted_by', 'source', 'submitted_at', 'status',
+            'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
+            'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
+            'decision', 'decision_reason', 'decided_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'submitted_by', 'submitted_at', 'social_snapshot', 'decision', 'decided_at', 'updated_at',
+        ]
+
+    def validate(self, attrs):
+        if self.instance is None and not attrs.get('vendor') and not attrs.get('vendor_data'):
+            raise serializers.ValidationError({'vendor': 'Provide an existing vendor id or vendor_data.'})
+        if self.instance is not None and 'vendor' in attrs and attrs['vendor'] != self.instance.vendor:
+            raise serializers.ValidationError({'vendor': 'An application cannot move to another vendor.'})
+        return attrs
+
+
+class ApplicationStatusChangeSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=Application.Status.choices)
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class InternalNoteSerializer(serializers.ModelSerializer):
+    author = UserSummarySerializer(read_only=True)
+
+    class Meta:
+        model = InternalNote
+        fields = ['id', 'vendor', 'application', 'author', 'note_type', 'body', 'created_at']
+        read_only_fields = ['id', 'vendor', 'author', 'created_at']
+
+
+class ActivityEventSerializer(serializers.ModelSerializer):
+    actor = UserSummarySerializer(read_only=True)
+
+    class Meta:
+        model = ActivityEvent
+        fields = ['id', 'vendor', 'application', 'task', 'event_type', 'description', 'actor', 'created_at', 'metadata']
+        read_only_fields = fields
