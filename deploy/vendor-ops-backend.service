@@ -1,0 +1,27 @@
+[Unit]
+Description=The Good Flea Vendor Ops Django API
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=vendorops
+Group=www-data
+WorkingDirectory=/opt/vendor-ops/backend-current
+EnvironmentFile=/etc/vendor-ops/backend.env
+RuntimeDirectory=vendor-ops
+RuntimeDirectoryMode=0755
+UMask=0007
+ExecStart=/opt/vendor-ops/venv/bin/gunicorn config.wsgi:application --bind unix:/run/vendor-ops/gunicorn.sock --workers 3 --timeout 60 --access-logfile - --error-logfile -
+ExecReload=/bin/kill -s HUP $MAINPID
+KillSignal=SIGQUIT
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

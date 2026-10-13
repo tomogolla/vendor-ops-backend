@@ -1,0 +1,84 @@
+name: Backend CI/CD
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: vendor_ops_ci
+          POSTGRES_USER: vendor_ops
+          POSTGRES_PASSWORD: vendor_ops_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vendor_ops -d vendor_ops_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DJANGO_SECRET_KEY: ci-only-not-for-production
+      DJANGO_DEBUG: "false"
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+      DATABASE_URL: postgres://vendor_ops:vendor_ops_ci@127.0.0.1:5432/vendor_ops_ci
+      CORS_ALLOWED_ORIGINS: ""
+      CSRF_TRUSTED_ORIGINS: ""
+      DJANGO_SECURE_COOKIES: "false"
+      DJANGO_SECURE_SSL_REDIRECT: "false"
+      DJANGO_HSTS_SECONDS: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python manage.py check
+      - run: python manage.py makemigrations --check --dry-run
+      - run: python manage.py test
+
+  deploy:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package release
+        run: tar --exclude=.git --exclude=.env --exclude=.venv --exclude='*/__pycache__' -czf backend-release.tar.gz .
+      - name: Configure SSH
+        env:
+          SSH_HOST: ${{ secrets.DROPLET_HOST }}
+          SSH_KEY: ${{ secrets.DROPLET_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DROPLET_SSH_KNOWN_HOSTS }}
+          SSH_PORT: ${{ secrets.DROPLET_SSH_PORT || '22' }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Upload and activate release
+        env:
+          SSH_HOST: ${{ secrets.DROPLET_HOST }}
+          SSH_USER: ${{ secrets.DROPLET_USER }}
+          SSH_PORT: ${{ secrets.DROPLET_SSH_PORT || '22' }}
+          RELEASE_ID: ${{ github.sha }}
+        run: |
+          remote_artifact="/tmp/vendor-ops-backend-${RELEASE_ID}.tar.gz"
+          scp -P "$SSH_PORT" backend-release.tar.gz "$SSH_USER@$SSH_HOST:$remote_artifact"
+          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p /tmp/vendor-ops-backend-${RELEASE_ID} && tar -xzf '$remote_artifact' -C /tmp/vendor-ops-backend-${RELEASE_ID} ./deploy/deploy-backend.sh && sudo bash /tmp/vendor-ops-backend-${RELEASE_ID}/deploy/deploy-backend.sh '$remote_artifact' '$RELEASE_ID'"
