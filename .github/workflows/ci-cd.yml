@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Package release
-        run: tar --exclude=.git --exclude=.env --exclude=.venv --exclude='*/__pycache__' -czf backend-release.tar.gz .
+        run: tar --exclude=.git --exclude=.env --exclude=.venv --exclude='*/__pycache__' -czf "$RUNNER_TEMP/backend-release.tar.gz" .
       - name: Configure SSH
         env:
           SSH_HOST: ${{ secrets.DROPLET_HOST }}
@@ -80,5 +80,5 @@ jobs:
           RELEASE_ID: ${{ github.sha }}
         run: |
           remote_artifact="/tmp/vendor-ops-backend-${RELEASE_ID}.tar.gz"
-          scp -P "$SSH_PORT" backend-release.tar.gz "$SSH_USER@$SSH_HOST:$remote_artifact"
+          scp -P "$SSH_PORT" "$RUNNER_TEMP/backend-release.tar.gz" "$SSH_USER@$SSH_HOST:$remote_artifact"
           ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p /tmp/vendor-ops-backend-${RELEASE_ID} && tar -xzf '$remote_artifact' -C /tmp/vendor-ops-backend-${RELEASE_ID} ./deploy/deploy-backend.sh && sudo bash /tmp/vendor-ops-backend-${RELEASE_ID}/deploy/deploy-backend.sh '$remote_artifact' '$RELEASE_ID'"
