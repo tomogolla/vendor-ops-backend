@@ -2,9 +2,11 @@ from rest_framework import serializers
 
 from accounts.models import User
 from accounts.serializers import UserSummarySerializer
+from catalog.models import AddOn, BoothVariant
 from tasks.models import Task
 
-from .models import ActivityEvent, Application, InternalNote, Vendor
+from .models import ActivityEvent, Application, ApplicationLine, InternalNote, Vendor
+from .pipeline import application_totals
 from .services import MatchResult
 
 VENDOR_EDITABLE_FIELDS = [
@@ -113,6 +115,49 @@ class QualificationChangeSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
 
 
+class ApplicationLineSerializer(serializers.ModelSerializer):
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=BoothVariant.objects.select_related('weekend'), allow_null=True, required=False,
+    )
+    add_on = serializers.PrimaryKeyRelatedField(
+        queryset=AddOn.objects.select_related('weekend'), allow_null=True, required=False,
+    )
+    parent_line = serializers.PrimaryKeyRelatedField(
+        queryset=ApplicationLine.objects.select_related('variant'), allow_null=True, required=False,
+    )
+    quantity = serializers.IntegerField(min_value=1, required=False, default=1)
+    kind = serializers.SerializerMethodField()
+    product_name = serializers.SerializerMethodField()
+    weekend = serializers.SerializerMethodField()
+    total_cents = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ApplicationLine
+        fields = [
+            'id', 'application', 'kind', 'variant', 'add_on', 'parent_line', 'product_name', 'weekend',
+            'quantity', 'unit_price_cents', 'total_cents', 'status', 'status_reason',
+            'waitlisted_at', 'confirmed_at', 'closed_at', 'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'application', 'unit_price_cents', 'status', 'status_reason',
+            'waitlisted_at', 'confirmed_at', 'closed_at', 'created_at', 'updated_at',
+        ]
+
+    def get_kind(self, line):
+        return 'booth' if line.variant_id else 'add_on'
+
+    def get_product_name(self, line):
+        return line.product.name
+
+    def get_weekend(self, line):
+        weekend = line.weekend
+        return {'id': str(weekend.pk), 'label': weekend.label, 'start_date': weekend.start_date}
+
+
+class LineDecisionSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=2000, default='')
+
+
 class ApplicationSerializer(serializers.ModelSerializer):
     vendor = serializers.PrimaryKeyRelatedField(queryset=Vendor.objects.all(), required=False)
     vendor_detail = VendorSummarySerializer(source='vendor', read_only=True)
@@ -123,6 +168,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
     submitted_by = UserSummarySerializer(read_only=True)
     # DEPRECATED (v1.3): derived from `stage` for the current frontend.
     status = serializers.CharField(source='derived_status', read_only=True)
+    lines = ApplicationLineSerializer(many=True, read_only=True)
 
     class Meta:
         model = Application
@@ -131,7 +177,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'stage', 'stage_entered_at', 'status', 'legacy_status',
             'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
             'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
-            'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
+            'lines', 'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
             'decision', 'decision_reason', 'decided_at', 'updated_at',
         ]
         read_only_fields = [
@@ -139,6 +185,13 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
             'decision', 'decided_at', 'updated_at',
         ]
+
+    def to_representation(self, application):
+        """Adds currency, requested_total_cents, confirmed_subtotal_cents, discount_cents and
+        confirmed_total_cents, computed from the (prefetched) lines."""
+        data = super().to_representation(application)
+        data.update(application_totals(application, list(application.lines.all())))
+        return data
 
     def validate(self, attrs):
         if self.instance is None and not attrs.get('vendor') and not attrs.get('vendor_data'):

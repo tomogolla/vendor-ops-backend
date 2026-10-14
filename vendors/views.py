@@ -1,7 +1,7 @@
 from django.db.models import Prefetch
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -11,20 +11,24 @@ from tasks.models import Task
 
 from . import pipeline, services
 from .filters import ApplicationFilter, VendorFilter
-from .models import Application, Vendor
+from .models import Application, ApplicationLine, Vendor
 from .serializers import (
     VENDOR_EDITABLE_FIELDS,
     ActivityEventSerializer,
+    ApplicationLineSerializer,
     ApplicationSerializer,
     ApplicationStageChangeSerializer,
     ApplicationStatusChangeSerializer,
     DiscountSerializer,
     InternalNoteSerializer,
+    LineDecisionSerializer,
     QualificationChangeSerializer,
     VendorSerializer,
     VendorStatusChangeSerializer,
     match_payload,
 )
+
+LINES_QUERYSET = ApplicationLine.objects.select_related('variant__weekend', 'add_on__weekend')
 
 DISCOUNT_FIELDS = {'discount_type', 'discount_value', 'discount_label'}
 # DEPRECATED (v1.3): legacy status values accepted by PATCH /applications/{id}/.
@@ -158,7 +162,9 @@ class ApplicationViewSet(
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
-        return Application.objects.select_related('vendor', 'reviewer', 'submitted_by')
+        return Application.objects.select_related('vendor', 'reviewer', 'submitted_by').prefetch_related(
+            Prefetch('lines', queryset=LINES_QUERYSET),
+        )
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -228,6 +234,21 @@ class ApplicationViewSet(
         serializer.save()
         return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)
 
+    @action(detail=True, methods=['get', 'post'])
+    def lines(self, request, pk=None):
+        """Any authenticated user may list and request lines; administrators decide them."""
+        application = self.get_object()
+        if request.method == 'POST':
+            serializer = ApplicationLineSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+            line = pipeline.add_line(
+                application, actor=request.user, variant=data.get('variant'), add_on=data.get('add_on'),
+                parent_line=data.get('parent_line'), quantity=data.get('quantity', 1),
+            )
+            return Response(ApplicationLineSerializer(LINES_QUERYSET.get(pk=line.pk)).data, status=status.HTTP_201_CREATED)
+        return Response(ApplicationLineSerializer(LINES_QUERYSET.filter(application=application), many=True).data)
+
     @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
     def stage(self, request, pk=None):
         application = self.get_object()
@@ -238,3 +259,53 @@ class ApplicationViewSet(
             reason=serializer.validated_data.get('reason', ''),
         )
         return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)
+
+
+class ApplicationLineViewSet(
+    mixins.RetrieveModelMixin, mixins.UpdateModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet,
+):
+    """PATCH and DELETE only while REQUESTED (any authenticated user); decisions are administrator actions."""
+
+    serializer_class = ApplicationLineSerializer
+    queryset = LINES_QUERYSET
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def partial_update(self, request, *args, **kwargs):
+        line = self.get_object()
+        unknown = set(request.data.keys()) - {'quantity'}
+        if unknown:
+            raise ValidationError({key: 'Only the quantity of a requested line can be changed.' for key in sorted(unknown)})
+        serializer = self.get_serializer(line, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        pipeline.update_line(line, actor=request.user, quantity=serializer.validated_data.get('quantity', line.quantity))
+        return Response(self.get_serializer(self.get_queryset().get(pk=line.pk)).data)
+
+    def perform_destroy(self, instance):
+        pipeline.remove_line(instance, actor=self.request.user)
+
+    def _decide(self, request, decide, **kwargs):
+        line = self.get_object()
+        decide(line, actor=request.user, **kwargs)
+        return Response(self.get_serializer(self.get_queryset().get(pk=line.pk)).data)
+
+    def _reason(self, request) -> str:
+        serializer = LineDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data['reason']
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def confirm(self, request, pk=None):
+        return self._decide(request, pipeline.confirm_line)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def waitlist(self, request, pk=None):
+        return self._decide(request, pipeline.waitlist_line, reason=self._reason(request))
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def decline(self, request, pk=None):
+        return self._decide(request, pipeline.decline_line, reason=self._reason(request))
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def release(self, request, pk=None):
+        """Release hold: a confirmed line gives its capacity back. A reason is required."""
+        return self._decide(request, pipeline.release_line, reason=self._reason(request))

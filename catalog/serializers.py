@@ -10,9 +10,24 @@ class UsageMixin(serializers.Serializer):
     confirmed = serializers.SerializerMethodField()
     remaining = serializers.SerializerMethodField()
     waitlisted = serializers.SerializerMethodField()
+    promotion_suggestions = serializers.SerializerMethodField(
+        help_text='Oldest waitlisted lines while there is room. Suggestions only; confirm them by hand.'
+    )
 
     def _usage(self, product):
         return self.context.get('usage', {}).get(product.pk)
+
+    def get_promotion_suggestions(self, product):
+        usage = self._usage(product)
+        return [
+            {
+                'line_id': str(line.pk), 'application_id': str(line.application_id),
+                'vendor_id': str(line.application.vendor_id), 'brand_name': line.application.vendor.brand_name,
+                'quantity': line.quantity, 'waitlisted_at': line.waitlisted_at,
+                'fits': usage.remaining is None or line.quantity <= usage.remaining,
+            }
+            for line in (usage.suggestions if usage else [])
+        ]
 
     def get_confirmed(self, product):
         usage = self._usage(product)
@@ -32,7 +47,7 @@ class BoothVariantSerializer(UsageMixin, serializers.ModelSerializer):
         model = BoothVariant
         fields = [
             'id', 'weekend', 'name', 'dimensions', 'price_cents', 'capacity',
-            'confirmed', 'remaining', 'waitlisted', 'created_at', 'updated_at',
+            'confirmed', 'remaining', 'waitlisted', 'promotion_suggestions', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'weekend', 'created_at', 'updated_at']
         # Uniqueness per weekend is checked in validate(); the weekend comes from the URL.
@@ -53,7 +68,7 @@ class AddOnSerializer(UsageMixin, serializers.ModelSerializer):
         model = AddOn
         fields = [
             'id', 'weekend', 'name', 'price_cents', 'capacity',
-            'confirmed', 'remaining', 'waitlisted', 'created_at', 'updated_at',
+            'confirmed', 'remaining', 'waitlisted', 'promotion_suggestions', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'weekend', 'created_at', 'updated_at']
         validators = []

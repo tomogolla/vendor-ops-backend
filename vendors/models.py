@@ -241,6 +241,78 @@ class Application(models.Model):
         return self.STAGE_TO_STATUS.get(self.stage, self.status)
 
 
+class ApplicationLine(models.Model):
+    """One booth, or one add-on for a booth line, requested on an application. Rules live in vendors.pipeline."""
+
+    class Status(models.TextChoices):
+        REQUESTED = 'REQUESTED', 'Requested'
+        CONFIRMED = 'CONFIRMED', 'Confirmed'
+        WAITLISTED = 'WAITLISTED', 'Waitlisted'
+        DECLINED = 'DECLINED', 'Declined'
+        CANCELLED = 'CANCELLED', 'Cancelled'
+
+    OPEN_STATUSES = (Status.REQUESTED, Status.WAITLISTED, Status.CONFIRMED)
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application = models.ForeignKey(Application, on_delete=models.CASCADE, related_name='lines')
+    variant = models.ForeignKey(
+        'catalog.BoothVariant', null=True, blank=True, on_delete=models.PROTECT, related_name='lines'
+    )
+    add_on = models.ForeignKey('catalog.AddOn', null=True, blank=True, on_delete=models.PROTECT, related_name='lines')
+    parent_line = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.PROTECT, related_name='add_on_lines',
+        help_text='The booth line an add-on line belongs to.',
+    )
+    quantity = models.PositiveIntegerField(default=1)
+    unit_price_cents = models.PositiveIntegerField(help_text='Price copied from the product when the line was added.')
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.REQUESTED)
+    status_reason = models.TextField(blank=True)
+    waitlisted_at = models.DateTimeField(null=True, blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['created_at']
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(variant__isnull=False, add_on__isnull=True) | Q(variant__isnull=True, add_on__isnull=False),
+                name='line_has_exactly_one_product',
+            ),
+            models.CheckConstraint(
+                condition=Q(add_on__isnull=True) | Q(parent_line__isnull=False), name='add_on_line_has_parent',
+            ),
+            models.CheckConstraint(
+                condition=Q(variant__isnull=True) | Q(parent_line__isnull=True), name='booth_line_has_no_parent',
+            ),
+            models.CheckConstraint(condition=Q(quantity__gte=1), name='line_quantity_at_least_one'),
+        ]
+        indexes = [
+            models.Index(fields=['variant', 'status']),
+            models.Index(fields=['add_on', 'status']),
+            models.Index(fields=['status', 'waitlisted_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.product} ×{self.quantity} ({self.get_status_display()})'
+
+    @property
+    def product(self):
+        return self.variant if self.variant_id else self.add_on
+
+    @property
+    def weekend(self):
+        return self.product.weekend
+
+    @property
+    def total_cents(self) -> int:
+        return self.quantity * self.unit_price_cents
+
+
 class InternalNote(models.Model):
     class NoteType(models.TextChoices):
         LEAD_INTAKE = 'LEAD_INTAKE', 'Lead intake'
@@ -285,6 +357,14 @@ class ActivityEvent(models.Model):
         APPLICATION_STATUS_CHANGED = 'APPLICATION_STATUS_CHANGED', 'Application status changed'  # pre-v1.3 history
         APPLICATION_STAGE_CHANGED = 'APPLICATION_STAGE_CHANGED', 'Application stage changed'
         APPLICATION_DISCOUNT_CHANGED = 'APPLICATION_DISCOUNT_CHANGED', 'Application discount changed'
+        LINE_ADDED = 'LINE_ADDED', 'Line added'
+        LINE_UPDATED = 'LINE_UPDATED', 'Line updated'
+        LINE_REMOVED = 'LINE_REMOVED', 'Line removed'
+        LINE_CONFIRMED = 'LINE_CONFIRMED', 'Line confirmed'
+        LINE_WAITLISTED = 'LINE_WAITLISTED', 'Line waitlisted'
+        LINE_DECLINED = 'LINE_DECLINED', 'Line declined'
+        LINE_CANCELLED = 'LINE_CANCELLED', 'Line cancelled'
+        LINE_RELEASED = 'LINE_RELEASED', 'Line hold released'
         VENDOR_STATUS_CHANGED = 'VENDOR_STATUS_CHANGED', 'Vendor status changed'
         NOTE_ADDED = 'NOTE_ADDED', 'Note added'
 
