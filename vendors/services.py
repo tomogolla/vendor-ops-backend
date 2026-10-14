@@ -2,12 +2,16 @@
 
 from dataclasses import dataclass, field
 
+from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from accounts.permissions import is_admin
-from tasks.services import ensure_application_review, ensure_discovery_call
+from tasks.models import Task
+from tasks.services import already_reached, ensure_application_review, ensure_discovery_call
 
+from . import pipeline
 from .activity import record_activity
 from .models import ActivityEvent, Application, InternalNote, LeadIntakeEvent, Vendor
 from .normalization import normalize_email, normalize_instagram, normalize_phone
@@ -90,18 +94,18 @@ def register_lead(*, actor, data: dict, owner=None, confirm_duplicate=False, sou
         raise DuplicateVendor(result)
 
     vendor = Vendor.objects.create(**data, owner=owner, created_by=actor)
-    LeadIntakeEvent.objects.create(
-        vendor=vendor,
-        source_type=LeadIntakeEvent.SourceType.MANUAL_REGISTRATION,
-        source_detail=source_detail or vendor.lead_source,
-        captured_by=actor,
-        metadata={'confirmed_possible_duplicate_of': [str(m.vendor.pk) for m in result.reliable]},
-    )
     record_activity(
         vendor, Event.LEAD_REGISTERED, f'{vendor.brand_name} registered as a lead', actor=actor,
         lead_source=vendor.lead_source,
     )
-    ensure_discovery_call(vendor, actor=actor, owner=owner)
+    # v1.3: every entry path opens an application (and its discovery call).
+    submit_application(
+        actor=actor, vendor=vendor, source='Staff entry',
+        intake=Intake(
+            LeadIntakeEvent.SourceType.MANUAL_REGISTRATION, source_detail or vendor.lead_source,
+            metadata={'confirmed_possible_duplicate_of': [str(m.vendor.pk) for m in result.reliable]},
+        ),
+    )
     return vendor
 
 
@@ -112,12 +116,35 @@ class AmbiguousVendorMatch(Exception):
         self.result = result
 
 
+@dataclass
+class Intake:
+    """How the submission arrived; recorded as one LeadIntakeEvent."""
+    source_type: str = LeadIntakeEvent.SourceType.APPLICATION_SUBMISSION
+    source_detail: str = ''
+    import_batch: object = None
+    metadata: dict = field(default_factory=dict)
+
+
+@transaction.atomic
 def submit_application(
     *, actor, vendor: Vendor | None = None, vendor_data: dict | None = None,
-    application_data: dict | None = None, source='Staff entry',
+    application_data: dict | None = None, source='Staff entry', lines: list[dict] | None = None,
+    notes: str = '', intake: Intake | None = None, create_call: bool = True,
 ) -> Application:
+    """Every entry path comes through here.
+
+    Bundling (Proposed rule): if the vendor already has an application at NEW or IN_REVIEW, no second
+    one is created: the submitted lines and notes are added to it, APPLICATION_BUNDLED is recorded
+    and no tasks are created. Otherwise a new application starts at IN_REVIEW (with its review task)
+    when a previous call reached the vendor, or at NEW with a discovery call task.
+
+    `lines` items look like {'variant': BoothVariant, 'quantity': 1, 'add_ons': [{'add_on': AddOn,
+    'quantity': 1}]}. The returned application carries two transient flags: `bundled` and
+    `call_created`.
+    """
     vendor_data = vendor_data or {}
     application_data = application_data or {}
+    intake = intake or Intake(source_detail=source)
 
     created_vendor = False
     if vendor is None:
@@ -133,20 +160,38 @@ def submit_application(
             created_vendor = True
 
     LeadIntakeEvent.objects.create(
-        vendor=vendor,
-        source_type=LeadIntakeEvent.SourceType.APPLICATION_SUBMISSION,
-        source_detail=source,
-        captured_by=actor,
-        metadata={'created_vendor': created_vendor},
+        vendor=vendor, source_type=intake.source_type, source_detail=intake.source_detail or source,
+        import_batch=intake.import_batch, captured_by=actor,
+        metadata={**intake.metadata, 'created_vendor': created_vendor},
     )
     if vendor.journey_stage == Vendor.JourneyStage.LEAD:
         vendor.journey_stage = Vendor.JourneyStage.APPLICANT
         vendor.save(update_fields=['journey_stage'])
 
+    open_application = (
+        Application.objects.select_for_update().filter(vendor=vendor, stage__in=pipeline.BUNDLING_STAGES)
+        .order_by('submitted_at').first()
+    )
+    if open_application:
+        added = _add_submitted_lines(open_application, lines, actor)
+        if notes:
+            add_note(vendor, actor=actor, body=notes, note_type=InternalNote.NoteType.APPLICATION_REVIEW,
+                     application=open_application)
+        record_activity(
+            vendor, Event.APPLICATION_BUNDLED, f'Submission ({source}) added to the open application',
+            actor=actor, application=open_application, source=source, created_vendor=created_vendor,
+            line_ids=[str(line.pk) for line in added], submitted_data=_jsonable(application_data),
+        )
+        open_application.bundled, open_application.call_created = True, False
+        return open_application
+
+    reached = already_reached(vendor)
     application = Application.objects.create(
         vendor=vendor,
         submitted_by=actor,
         source=source,
+        stage=Stage.IN_REVIEW if reached else Stage.NEW,
+        status=Application.STAGE_TO_STATUS[Stage.IN_REVIEW if reached else Stage.NEW],
         category=application_data.get('category') or vendor.category,
         product_description=application_data.get('product_description') or vendor.description,
         social_snapshot={'website': vendor.website, 'instagram': vendor.instagram},
@@ -155,11 +200,40 @@ def submit_application(
     sync_application_summary(vendor)
     record_activity(
         vendor, Event.APPLICATION_SUBMITTED, f'Application submitted ({source})', actor=actor,
-        application=application, created_vendor=created_vendor,
+        application=application, created_vendor=created_vendor, stage=application.stage,
     )
-    ensure_discovery_call(vendor, actor=actor, application=application, skip_if_reached=True)
-    ensure_application_review(application, actor=actor)
+    call_created = False
+    if reached:
+        ensure_application_review(application, actor=actor)
+    elif create_call:
+        call, call_created = ensure_discovery_call(vendor, actor=actor, application=application)
+        if call is not None and call.application_id is None:
+            # A call opened before v1.3 (or before this application) now belongs to it.
+            call.application = application
+            call.save(update_fields=['application', 'updated_at'])
+    _add_submitted_lines(application, lines, actor)
+    if notes:
+        add_note(vendor, actor=actor, body=notes, note_type=InternalNote.NoteType.APPLICATION_REVIEW,
+                 application=application)
+    application.bundled, application.call_created = False, call_created
     return application
+
+
+def _add_submitted_lines(application: Application, lines: list[dict] | None, actor) -> list:
+    added = []
+    for item in lines or []:
+        booth = pipeline.add_line(application, actor=actor, variant=item['variant'], quantity=item.get('quantity', 1))
+        added.append(booth)
+        for extra in item.get('add_ons', []):
+            added.append(pipeline.add_line(
+                application, actor=actor, add_on=extra['add_on'], parent_line=booth, quantity=extra.get('quantity', 1),
+            ))
+    return added
+
+
+def _jsonable(data: dict) -> dict:
+    return {key: value if isinstance(value, (str, int, float, bool, list, dict, type(None))) else str(value)
+            for key, value in data.items()}
 
 
 # --- Qualification and the deprecated vendor status --------------------------
@@ -261,6 +335,49 @@ def _suspend_or_reinstate(vendor: Vendor, *, suspend: bool, actor, note=''):
         vendor, Event.VENDOR_STATUS_CHANGED, f'Vendor {current} → {vendor.display_status}', actor=actor,
         **{'from': current, 'to': to, 'note': note, 'previous_journey_stage': previous},
     )
+
+
+# --- One-off backfill (v1.3) -------------------------------------------------
+
+BACKFILL_DECLINE_REASON = 'Not qualified (migrated)'
+
+
+def backfill_lead_applications() -> dict:
+    """Gives every pre-v1.3 lead (journey LEAD, no application) an application: NEW, or DECLINED
+    for leads marked not qualified. Idempotent: vendors that have any application are skipped.
+    Journey and qualification fields are left as they are. Run by the backfill_applications
+    management command, never by a migration."""
+    counts = {'new': 0, 'declined': 0, 'calls_linked': 0}
+    leads = Vendor.objects.filter(journey_stage=Vendor.JourneyStage.LEAD, applications__isnull=True)
+    for vendor in leads.order_by('created_at'):
+        declined = vendor.qualification_status == Vendor.Qualification.NOT_QUALIFIED
+        stage = Stage.DECLINED if declined else Stage.NEW
+        now = timezone.now()
+        application = Application.objects.create(
+            vendor=vendor, source=vendor.lead_source, stage=stage, status=Application.STAGE_TO_STATUS[stage],
+            category=vendor.category, product_description=vendor.description,
+            social_snapshot={'website': vendor.website, 'instagram': vendor.instagram},
+            decision=Application.Status.DECLINED if declined else '',
+            decision_reason=BACKFILL_DECLINE_REASON if declined else '',
+            decided_at=now if declined else None,
+        )
+        # submitted_at is auto_now_add; the backfill dates the application from the vendor.
+        Application.objects.filter(pk=application.pk).update(
+            submitted_at=vendor.created_at, stage_entered_at=now if declined else vendor.created_at,
+        )
+        record_activity(
+            vendor, Event.APPLICATION_SUBMITTED, 'Application created for an existing lead (v1.3 backfill)',
+            application=application, backfill=True, stage=stage,
+            reason=BACKFILL_DECLINE_REASON if declined else '',
+        )
+        counts['declined' if declined else 'new'] += 1
+        if not declined:
+            linked = Task.objects.filter(
+                vendor=vendor, application__isnull=True, task_type=Task.TaskType.DISCOVERY_CALL,
+                status__in=Task.OPEN_STATUSES,
+            ).update(application=application)
+            counts['calls_linked'] += linked
+    return counts
 
 
 # --- Notes -------------------------------------------------------------------

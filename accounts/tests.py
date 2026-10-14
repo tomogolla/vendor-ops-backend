@@ -57,7 +57,11 @@ class RoleTests(ApiTestCase):
         self.assertEqual(names, {'admin', 'member', 'other'})
 
     def test_member_cannot_change_status_beyond_application(self):
-        vendor = self.lead()
+        # Changed in v1.3: registering a lead now opens an application, so a vendor in the legacy
+        # 'lead' status only exists in pre-v1.3 data; build one directly.
+        from vendors.models import Vendor
+
+        vendor = {'id': str(Vendor.objects.create(brand_name='Legacy Lead', instagram='@legacylead').pk)}
         member = self.as_user(self.member)
         self.assertEqual(member.post(f"/api/v1/vendors/{vendor['id']}/status/", {'status': 'declined'}).status_code, 403)
         self.assertEqual(member.post(f"/api/v1/vendors/{vendor['id']}/status/", {'status': 'applied'}).status_code, 200)

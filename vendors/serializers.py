@@ -6,7 +6,7 @@ from catalog.models import AddOn, BoothVariant
 from tasks.models import Task
 
 from .models import ActivityEvent, Application, ApplicationLine, InternalNote, Vendor
-from .pipeline import application_totals
+from .pipeline import application_totals, exhausted_calls
 from .services import MatchResult
 
 VENDOR_EDITABLE_FIELDS = [
@@ -154,6 +154,18 @@ class ApplicationLineSerializer(serializers.ModelSerializer):
         return {'id': str(weekend.pk), 'label': weekend.label, 'start_date': weekend.start_date}
 
 
+class SubmittedAddOnSerializer(serializers.Serializer):
+    add_on = serializers.PrimaryKeyRelatedField(queryset=AddOn.objects.select_related('weekend'))
+    quantity = serializers.IntegerField(min_value=1, default=1)
+
+
+class SubmittedLineSerializer(serializers.Serializer):
+    """A booth requested with a submission, optionally with add-ons for that booth."""
+    variant = serializers.PrimaryKeyRelatedField(queryset=BoothVariant.objects.select_related('weekend'))
+    quantity = serializers.IntegerField(min_value=1, default=1)
+    add_ons = SubmittedAddOnSerializer(many=True, required=False, default=list)
+
+
 class LineDecisionSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000, default='')
 
@@ -169,12 +181,17 @@ class ApplicationSerializer(serializers.ModelSerializer):
     # DEPRECATED (v1.3): derived from `stage` for the current frontend.
     status = serializers.CharField(source='derived_status', read_only=True)
     lines = ApplicationLineSerializer(many=True, read_only=True)
+    requested_lines = SubmittedLineSerializer(many=True, write_only=True, required=False)
+    notes = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=5000)
+    call_exhausted = serializers.SerializerMethodField(
+        help_text='The call task closed after the last allowed No Answer; what happens next is undecided.'
+    )
 
     class Meta:
         model = Application
         fields = [
-            'id', 'vendor', 'vendor_detail', 'vendor_data', 'submitted_by', 'source', 'submitted_at',
-            'stage', 'stage_entered_at', 'status', 'legacy_status',
+            'id', 'vendor', 'vendor_detail', 'vendor_data', 'requested_lines', 'notes', 'submitted_by', 'source',
+            'submitted_at', 'stage', 'stage_entered_at', 'call_exhausted', 'status', 'legacy_status',
             'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
             'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
             'lines', 'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
@@ -185,6 +202,12 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
             'decision', 'decided_at', 'updated_at',
         ]
+
+    def get_call_exhausted(self, application) -> bool:
+        annotated = getattr(application, 'call_exhausted', None)
+        if annotated is not None:
+            return annotated
+        return exhausted_calls().filter(application=application).exists()
 
     def to_representation(self, application):
         """Adds currency, requested_total_cents, confirmed_subtotal_cents, discount_cents and

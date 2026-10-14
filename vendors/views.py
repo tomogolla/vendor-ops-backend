@@ -1,4 +1,4 @@
-from django.db.models import Prefetch
+from django.db.models import Exists, OuterRef, Prefetch
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -164,14 +164,20 @@ class ApplicationViewSet(
     def get_queryset(self):
         return Application.objects.select_related('vendor', 'reviewer', 'submitted_by').prefetch_related(
             Prefetch('lines', queryset=LINES_QUERYSET),
+        ).annotate(
+            call_exhausted=Exists(pipeline.exhausted_calls().filter(application=OuterRef('pk'))),
         )
 
     def create(self, request, *args, **kwargs):
+        """+Add vendor: looks the vendor up (or creates it) and submits. A submission for a vendor
+        with an application at NEW or IN_REVIEW is bundled into it and answered with 200."""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
         vendor = data.pop('vendor', None)
         raw_vendor_data = data.pop('vendor_data', None)
+        requested_lines = data.pop('requested_lines', [])
+        notes = data.pop('notes', '')
         if request.data.get('status') not in (None, Application.Status.SUBMITTED) or request.data.get('stage'):
             raise PermissionDenied('New applications start as submitted.')
         reviewer = data.pop('reviewer', None)
@@ -188,6 +194,7 @@ class ApplicationViewSet(
             application = services.submit_application(
                 actor=request.user, vendor=vendor, vendor_data=vendor_data,
                 application_data={**data, 'reviewer': reviewer} if reviewer else data, source=source,
+                lines=requested_lines, notes=notes,
             )
         except services.AmbiguousVendorMatch as ambiguous:
             return Response(
@@ -195,7 +202,8 @@ class ApplicationViewSet(
                  'code': 'ambiguous_vendor', **match_payload(ambiguous.result)},
                 status=status.HTTP_409_CONFLICT,
             )
-        return Response(self.get_serializer(application).data, status=status.HTTP_201_CREATED)
+        body = {**self.get_serializer(self.get_queryset().get(pk=application.pk)).data, 'bundled': application.bundled}
+        return Response(body, status=status.HTTP_200_OK if application.bundled else status.HTTP_201_CREATED)
 
     def partial_update(self, request, *args, **kwargs):
         application = self.get_object()
@@ -227,7 +235,7 @@ class ApplicationViewSet(
                 application, actor=request.user, discount_type=discount.validated_data['discount_type'],
                 value=discount.validated_data['discount_value'], label=discount.validated_data['discount_label'],
             )
-        skip = {'status', 'decision_reason', 'vendor_data', *DISCOUNT_FIELDS}
+        skip = {'status', 'decision_reason', 'vendor_data', 'requested_lines', 'notes', *DISCOUNT_FIELDS}
         data = {k: v for k, v in request.data.items() if k not in skip}
         serializer = self.get_serializer(application, data=data, partial=True)
         serializer.is_valid(raise_exception=True)

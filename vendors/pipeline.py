@@ -35,6 +35,8 @@ MANUAL_STAGE_TRANSITIONS = {
 }
 # Reached only through mark_billed / mark_first_payment, and never left by hand.
 BILLING_STAGES = {Stage.AWAITING_PAYMENT, Stage.WON}
+# A new submission is bundled into a vendor's application at one of these stages.
+BUNDLING_STAGES = (Stage.NEW, Stage.IN_REVIEW)
 CLOSED_STAGES = {Stage.DECLINED, Stage.WITHDRAWN}
 CLOSABLE_TASK_TYPES = (Task.TaskType.DISCOVERY_CALL, Task.TaskType.APPLICATION_REVIEW)
 
@@ -103,6 +105,24 @@ def move_stage(application: Application, to: str, *, actor, reason='', system=Fa
            'cancelled_task_ids': cancelled_tasks, **metadata},
     )
     return application
+
+
+def advance_after_call_attempt(application: Application, actor) -> Application:
+    """System action, allowed for any user who may log the call: the first call attempt logged on
+    the application's call task moves a NEW application into review (creating the review task).
+    A call closed after the last No Answer leaves the stage alone (see call_exhausted)."""
+    if application.stage == Stage.NEW:
+        move_stage(application, Stage.IN_REVIEW, actor=actor, reason='Call attempt logged', system=True)
+    return application
+
+
+def exhausted_calls():
+    """Discovery calls closed after the last allowed No Answer. TODO(decision): what happens to the
+    application after that is open; for now the stage is left unchanged and `call_exhausted` is exposed."""
+    return Task.objects.filter(
+        task_type=Task.TaskType.DISCOVERY_CALL, status=Task.Status.COMPLETED,
+        outcome=Task.CallOutcome.NO_ANSWER, attempt_count__gte=settings.MAX_CALL_ATTEMPTS,
+    )
 
 
 def _close_open_work(application: Application, actor, reason: str) -> list[str]:

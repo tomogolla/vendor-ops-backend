@@ -7,12 +7,11 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import URLValidator, validate_email
 from django.db import transaction
 
-from tasks.services import ensure_discovery_call
 from vendors.activity import record_activity
 from vendors.models import ActivityEvent, LeadIntakeEvent, Vendor
 from vendors.normalization import normalize_email, normalize_instagram, normalize_phone
 from vendors.options import CATEGORIES, LEAD_SOURCES, canonical
-from vendors.services import find_matches
+from vendors.services import Intake, find_matches, submit_application
 
 from .models import ImportBatch
 
@@ -188,11 +187,27 @@ def preview(raw: bytes) -> dict:
 
 def confirm(raw: bytes, *, actor, file_name='', include_lines: set[int] | None = None) -> dict:
     """Re-classifies on the server (the preview is never trusted) and imports in one transaction.
-    `include_lines` lists possible-duplicate rows the user chose to import as new vendors."""
+    `include_lines` lists possible-duplicate rows the user chose to import as new vendors.
+
+    v1.3: every imported row is an applicant and goes through submit_application, so new and
+    matched rows get an application at NEW (bundled into an open one for matched vendors). The
+    already-contacted, inactive and do-not-contact flags still suppress the discovery call."""
     include_lines = include_lines or set()
     result = preview(raw)
     Event = ActivityEvent.EventType
-    summary = {'created': 0, 'matched': 0, 'skipped': 0, 'invalid': 0, 'call_tasks_created': 0, 'vendor_ids': []}
+    summary = {
+        'created': 0, 'matched': 0, 'skipped': 0, 'invalid': 0, 'call_tasks_created': 0,
+        'applications_created': 0, 'applications_bundled': 0, 'vendor_ids': [],
+    }
+
+    def submit(vendor, metadata, notes=''):
+        application = submit_application(
+            actor=actor, vendor=vendor, source='CSV import', notes=notes,
+            create_call=not metadata['flags']['already_contacted'],
+            intake=Intake(LeadIntakeEvent.SourceType.CSV_IMPORT, file_name, import_batch=batch, metadata=metadata),
+        )
+        summary['applications_bundled' if application.bundled else 'applications_created'] += 1
+        summary['call_tasks_created'] += int(application.call_created)
 
     with transaction.atomic():
         batch = ImportBatch.objects.create(file_name=file_name[:255], created_by=actor)
@@ -211,12 +226,9 @@ def confirm(raw: bytes, *, actor, file_name='', include_lines: set[int] | None =
             metadata = {'line': row['line'], 'flags': flags}
             if kind == Classification.MATCHED:
                 vendor = Vendor.objects.get(pk=row['matches'][0]['vendor']['id'])
-                LeadIntakeEvent.objects.create(
-                    vendor=vendor, source_type=LeadIntakeEvent.SourceType.CSV_IMPORT, source_detail=file_name,
-                    import_batch=batch, captured_by=actor, metadata={**metadata, 'matched': True, 'row': row['data']},
-                )
                 record_activity(vendor, Event.LEAD_IMPORTED, f'Matched existing vendor in CSV import ({file_name or "CSV"})',
                                 actor=actor, batch=str(batch.pk), matched=True)
+                submit(vendor, {**metadata, 'matched': True, 'row': row['data']}, notes=row['data']['notes'])
                 summary['matched'] += 1
                 continue
 
@@ -224,17 +236,11 @@ def confirm(raw: bytes, *, actor, file_name='', include_lines: set[int] | None =
                 **row['data'], created_by=actor,
                 is_active=not flags['inactive'], outreach_opt_out=flags['exclude_from_outreach'],
             )
-            LeadIntakeEvent.objects.create(
-                vendor=vendor, source_type=LeadIntakeEvent.SourceType.CSV_IMPORT, source_detail=file_name,
-                import_batch=batch, captured_by=actor, metadata=metadata,
-            )
             record_activity(vendor, Event.LEAD_IMPORTED, f'Imported from CSV ({file_name or "CSV"})',
                             actor=actor, batch=str(batch.pk))
+            submit(vendor, metadata)
             summary['created'] += 1
             summary['vendor_ids'].append(str(vendor.pk))
-            if not flags['already_contacted']:
-                _, created = ensure_discovery_call(vendor, actor=actor)
-                summary['call_tasks_created'] += int(created)
 
         batch.summary = {k: v for k, v in summary.items() if k != 'vendor_ids'}
         batch.save(update_fields=['summary'])

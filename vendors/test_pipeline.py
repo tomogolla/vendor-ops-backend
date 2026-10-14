@@ -613,3 +613,150 @@ class LinePermissionTests(PipelineTestCase):
         with self.assertRaises(PermissionDenied):
             pipeline.release_line(line, actor=self.member, reason='x')
         self.assertEqual(self.as_user(self.other).get(f'/api/v1/applications/{application.pk}/lines/').status_code, 200)
+
+
+class EntryPathTests(PipelineTestCase):
+    def assert_new_with_call(self, application):
+        self.assertEqual(application.stage, Stage.NEW)
+        tasks = list(application.tasks.all())
+        self.assertEqual([(t.task_type, t.status) for t in tasks], [(Task.TaskType.DISCOVERY_CALL, Task.Status.TODO)])
+
+    def test_add_vendor_via_applications_creates_new_and_a_call(self):
+        response = self.as_user(self.member).post('/api/v1/applications/', {
+            'vendor_data': {'brand_name': 'Juniper', 'email': 'ana@juniper.example.com'},
+            'requested_lines': [{'variant': str(self.booth.pk), 'quantity': 1,
+                                 'add_ons': [{'add_on': str(self.tent.pk)}]}],
+            'notes': 'Met at the October market.',
+        }, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        body = response.json()
+        self.assertFalse(body['bundled'])
+        application = Application.objects.get(pk=body['id'])
+        self.assert_new_with_call(application)
+        lines = list(application.lines.order_by('created_at'))
+        self.assertEqual([(line.variant, line.add_on, line.parent_line) for line in lines],
+                         [(self.booth, None, None), (None, self.tent, lines[0])])
+        self.assertEqual(application.internal_notes.get().body, 'Met at the October market.')
+
+    def test_register_lead_goes_through_submission(self):
+        vendor = Vendor.objects.get(pk=self.lead()['id'])
+        self.assert_new_with_call(vendor.applications.get())
+        self.assertEqual(vendor.intake_events.get().source_type, 'MANUAL_REGISTRATION')
+
+    def test_csv_import_creates_new_applications_and_attaches_matched_rows(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        paid = self.at_stage(Stage.AWAITING_PAYMENT, vendor_data={'brand_name': 'Acme', 'email': 'cy@acme.example.com'})
+        csv = 'Brand,Email,Notes\nFresh,fresh@example.com,\nAcme Again,CY@acme.example.com,Wants November too\n'
+        upload = SimpleUploadedFile('rows.csv', csv.encode(), content_type='text/csv')
+        summary = self.as_user(self.admin).post('/api/v1/imports/vendors/confirm/', {'file': upload}, format='multipart').json()
+        self.assertEqual((summary['created'], summary['matched'], summary['applications_created']), (1, 1, 2))
+        self.assert_new_with_call(Vendor.objects.get(brand_name='Fresh').applications.get())
+
+        acme_applications = paid.vendor.applications.order_by('submitted_at')
+        self.assertEqual([a.stage for a in acme_applications], [Stage.AWAITING_PAYMENT, Stage.NEW])
+        self.assertEqual(acme_applications.last().internal_notes.get().body, 'Wants November too')
+
+    def test_starts_in_review_when_already_reached(self):
+        application = self.application()
+        call = application.tasks.get(task_type=Task.TaskType.DISCOVERY_CALL)
+        self.as_user(self.member).post(f'/api/v1/tasks/{call.pk}/log-call/', {'outcome': 'Interested'}, format='json')
+        pipeline.move_stage(application, Stage.WON, actor=self.admin)
+
+        again = self.application()
+        self.assertNotEqual(again.pk, application.pk)
+        self.assertEqual(again.stage, Stage.IN_REVIEW)
+        types = set(again.tasks.filter(status__in=Task.OPEN_STATUSES).values_list('task_type', flat=True))
+        self.assertEqual(types, {Task.TaskType.APPLICATION_REVIEW})
+        self.assertFalse(Task.objects.filter(vendor=again.vendor, task_type=Task.TaskType.DISCOVERY_CALL,
+                                             status__in=Task.OPEN_STATUSES).exists())
+
+
+class CallAutomationTests(PipelineTestCase):
+    def log(self, task, outcome='No Answer'):
+        return self.as_user(self.member).post(f'/api/v1/tasks/{task.pk}/log-call/', {'outcome': outcome}, format='json')
+
+    def test_first_call_attempt_moves_new_to_in_review(self):
+        application = self.application()
+        call = application.tasks.get(task_type=Task.TaskType.DISCOVERY_CALL)
+        self.assertEqual(self.log(call).status_code, 200)
+        application.refresh_from_db()
+        self.assertEqual(application.stage, Stage.IN_REVIEW)
+        self.assertTrue(application.tasks.filter(task_type=Task.TaskType.APPLICATION_REVIEW).exists())
+        event = application.activity.get(event_type=Event.APPLICATION_STAGE_CHANGED)
+        self.assertEqual((event.metadata['system'], event.actor), (True, self.member))
+
+    def test_five_no_answers_leave_the_stage_and_flag_call_exhausted(self):
+        application = self.application()
+        call = application.tasks.get(task_type=Task.TaskType.DISCOVERY_CALL)
+        url = f'/api/v1/applications/{application.pk}/'
+        for _ in range(4):
+            self.log(call)
+        self.assertFalse(self.as_user(self.member).get(url).json()['call_exhausted'])
+        self.assertEqual(self.log(call).json()['status'], 'COMPLETED')
+        body = self.as_user(self.member).get(url).json()
+        self.assertEqual((body['stage'], body['call_exhausted']), (Stage.IN_REVIEW, True))
+
+
+class BundlingTests(PipelineTestCase):
+    def submit(self, **payload):
+        payload.setdefault('vendor_data', {'brand_name': 'Juniper', 'email': 'ana@juniper.example.com'})
+        return self.as_user(self.member).post('/api/v1/applications/', payload, format='json')
+
+    def test_second_submission_is_bundled_into_the_open_application(self):
+        first = self.submit(requested_lines=[{'variant': str(self.booth.pk)}]).json()
+        tasks_before = Task.objects.count()
+        response = self.submit(requested_lines=[{'variant': str(self.other_booth.pk), 'quantity': 2}], notes='Also the 17th')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual((response.json()['id'], response.json()['bundled']), (first['id'], True))
+        application = Application.objects.get(pk=first['id'])
+        self.assertEqual(application.lines.count(), 2)
+        self.assertEqual(Task.objects.count(), tasks_before, 'no new tasks')
+        self.assertEqual(application.internal_notes.get().body, 'Also the 17th')
+        self.assertTrue(application.activity.filter(event_type=Event.APPLICATION_BUNDLED).exists())
+
+    def test_bundles_into_in_review_but_not_after_awaiting_payment(self):
+        application = self.at_stage(Stage.IN_REVIEW)
+        self.assertEqual(self.submit().json()['id'], str(application.pk))
+        pipeline.move_stage(application, Stage.AWAITING_PAYMENT, actor=self.admin)
+        response = self.submit()
+        self.assertEqual(response.status_code, 201)
+        self.assertNotEqual(response.json()['id'], str(application.pk))
+
+    def test_bundled_duplicate_line_is_rejected(self):
+        self.submit(requested_lines=[{'variant': str(self.booth.pk)}])
+        response = self.submit(requested_lines=[{'variant': str(self.booth.pk)}])
+        self.assertEqual(response.status_code, 400)
+
+
+class BackfillTests(PipelineTestCase):
+    def test_backfill_is_idempotent_and_supports_dry_run(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        lead = Vendor.objects.create(brand_name='Old Lead', instagram='@oldlead', lead_source='Instagram')
+        not_qualified = Vendor.objects.create(
+            brand_name='Old No', instagram='@oldno', qualification_status=Vendor.Qualification.NOT_QUALIFIED,
+        )
+        call = Task.objects.create(vendor=lead, title='Call', task_type=Task.TaskType.DISCOVERY_CALL)
+        already = self.application()
+
+        out = StringIO()
+        call_command('backfill_applications', '--dry-run', stdout=out)
+        self.assertIn('Would create 1 application(s) at NEW and 1 at DECLINED', out.getvalue())
+        self.assertFalse(lead.applications.exists())
+
+        call_command('backfill_applications', stdout=StringIO())
+        application = lead.applications.get()
+        self.assertEqual((application.stage, application.source), (Stage.NEW, 'Instagram'))
+        self.assertEqual(application.submitted_at, lead.created_at)
+        call.refresh_from_db()
+        self.assertEqual(call.application, application)
+        declined = not_qualified.applications.get()
+        self.assertEqual((declined.stage, declined.decision_reason), (Stage.DECLINED, 'Not qualified (migrated)'))
+        self.assertEqual(already.vendor.applications.count(), 1)
+
+        out = StringIO()
+        call_command('backfill_applications', stdout=out)
+        self.assertIn('Created 0 application(s) at NEW and 0 at DECLINED', out.getvalue())

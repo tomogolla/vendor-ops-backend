@@ -356,6 +356,7 @@ class ActivityEvent(models.Model):
         QUALIFICATION_CHANGED = 'QUALIFICATION_CHANGED', 'Qualification changed'
         APPLICATION_STATUS_CHANGED = 'APPLICATION_STATUS_CHANGED', 'Application status changed'  # pre-v1.3 history
         APPLICATION_STAGE_CHANGED = 'APPLICATION_STAGE_CHANGED', 'Application stage changed'
+        APPLICATION_BUNDLED = 'APPLICATION_BUNDLED', 'Submission bundled into open application'
         APPLICATION_DISCOUNT_CHANGED = 'APPLICATION_DISCOUNT_CHANGED', 'Application discount changed'
         LINE_ADDED = 'LINE_ADDED', 'Line added'
         LINE_UPDATED = 'LINE_UPDATED', 'Line updated'

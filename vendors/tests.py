@@ -50,7 +50,10 @@ class ManualRegistrationTests(ApiTestCase):
             self.as_user(self.member), email='Lil@Ember.example.com ', phone='+1 555 210 3344', owner=str(self.member.pk),
         )
         vendor = Vendor.objects.get(pk=data['id'])
-        self.assertEqual(data['status'], 'lead')
+        # Changed in v1.3: registration opens an application at NEW, so the vendor reads as applied.
+        self.assertEqual(data['status'], 'applied')
+        application = vendor.applications.get()
+        self.assertEqual(application.stage, Application.Stage.NEW)
         self.assertEqual((vendor.email_normalized, vendor.phone_normalized, vendor.instagram_normalized),
                          ('lil@ember.example.com', '5552103344', 'mossandthread'))
         self.assertEqual(vendor.created_by, self.member)
@@ -64,9 +67,10 @@ class ManualRegistrationTests(ApiTestCase):
                          (Task.TaskType.DISCOVERY_CALL, Task.Priority.HIGH, Task.Status.TODO, self.member))
         self.assertIsNotNone(task.due_at)
         self.assertEqual(task.created_by, self.member)
+        self.assertEqual(task.application, application)
 
         events = list(vendor.activity.order_by('created_at').values_list('event_type', flat=True))
-        self.assertEqual(events, [Event.LEAD_REGISTERED, Event.TASK_CREATED])
+        self.assertEqual(events, [Event.LEAD_REGISTERED, Event.APPLICATION_SUBMITTED, Event.TASK_CREATED])
         self.assertEqual(data['call']['open_task_id'], str(task.pk))
         self.assertTrue(data['call']['never_called'])
 
@@ -134,8 +138,10 @@ class ApplicationSubmissionTests(ApiTestCase):
         vendor = application.vendor
         self.assertEqual(vendor.display_status, 'applied')
         self.assertEqual(vendor.intake_events.get().source_type, LeadIntakeEvent.SourceType.APPLICATION_SUBMISSION)
+        # Changed in v1.3: the review task is created when the application enters IN_REVIEW, not at submission.
+        self.assertEqual(application.stage, Application.Stage.NEW)
         types = sorted(vendor.tasks.values_list('task_type', flat=True))
-        self.assertEqual(types, [Task.TaskType.APPLICATION_REVIEW, Task.TaskType.DISCOVERY_CALL])
+        self.assertEqual(types, [Task.TaskType.DISCOVERY_CALL])
         self.assertTrue(vendor.activity.filter(event_type=Event.APPLICATION_SUBMITTED, application=application).exists())
 
     def test_matches_existing_vendor_by_contact_details(self):
@@ -157,7 +163,10 @@ class ApplicationSubmissionTests(ApiTestCase):
         self.submit(vendor=vendor['id'])
         calls = Task.objects.filter(vendor_id=vendor['id'], task_type=Task.TaskType.DISCOVERY_CALL)
         self.assertEqual(calls.count(), 1)
-        self.assertEqual(Task.objects.filter(vendor_id=vendor['id'], task_type=Task.TaskType.APPLICATION_REVIEW).count(), 2)
+        # Changed in v1.3: repeat submissions are bundled into the open NEW application, and review
+        # tasks only exist from IN_REVIEW.
+        self.assertEqual(Application.objects.filter(vendor_id=vendor['id']).count(), 1)
+        self.assertEqual(Task.objects.filter(vendor_id=vendor['id'], task_type=Task.TaskType.APPLICATION_REVIEW).count(), 0)
 
     def test_reached_vendor_gets_review_but_no_new_call(self):
         vendor = self.lead()
@@ -184,7 +193,7 @@ class StatusTests(ApiTestCase):
         vendor = self.lead()
         admin = self.as_user(self.admin)
         url = f"/api/v1/vendors/{vendor['id']}/status/"
-        self.assertEqual(admin.post(url, {'status': 'applied'}).json()['status'], 'applied')
+        self.assertEqual(vendor['status'], 'applied')  # v1.3: registration already submits an application
         self.assertEqual(admin.post(url, {'status': 'in_review'}).json()['status'], 'in_review')
         response = admin.post(url, {'status': 'approved', 'note': 'Great fit'})
         self.assertEqual((response.status_code, response.json()['code']), (400, 'use_line_decisions'))
@@ -202,7 +211,8 @@ class StatusTests(ApiTestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_declined_lead_can_be_reopened(self):
-        vendor = self.lead()
+        # Changed in v1.3: only pre-v1.3 data has vendors in the 'lead' status; build one directly.
+        vendor = {'id': str(Vendor.objects.create(brand_name='Legacy Lead', instagram='@legacylead').pk)}
         admin = self.as_user(self.admin)
         url = f"/api/v1/vendors/{vendor['id']}/status/"
         self.assertEqual(admin.post(url, {'status': 'declined'}).json()['status'], 'declined')
@@ -221,7 +231,10 @@ class FilterTests(ApiTestCase):
 
         client = self.as_user(self.member)
         ids = lambda params: {v['id'] for v in client.get('/api/v1/vendors/', params).json()['results']}  # noqa: E731
-        self.assertEqual(ids({'status': 'lead'}), {lead['id'], called['id']})
+        # Changed in v1.3: registered leads are applicants, and a logged call moves them into review.
+        self.assertEqual(ids({'status': 'lead'}), set())
+        self.assertEqual(ids({'status': 'applied'}), {lead['id']})
+        self.assertEqual(ids({'status': 'in_review'}), {called['id']})
         self.assertEqual(ids({'status': 'approved'}), set())
         self.assertEqual(ids({'call': 'due'}), {lead['id'], called['id']})
         self.assertEqual(ids({'call': 'none'}), {lead['id']})
@@ -234,7 +247,7 @@ class ActivityImmutabilityTests(ApiTestCase):
         client = self.as_user(self.admin)
         url = f"/api/v1/vendors/{vendor['id']}/activity/"
         events = client.get(url).json()['results']
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 3)  # v1.3: registered, application submitted, task created
         for method in (client.post, client.put, client.patch, client.delete):
             self.assertEqual(method(url, {}, format='json').status_code, 405)
 
