@@ -3,15 +3,18 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from accounts.views import CsrfView, LoginView, LogoutView, MeView, TeamView, UserViewSet
+from catalog.views import MarketWeekendViewSet
 from imports.views import ImportConfirmView, ImportPreviewView
 from tasks.views import TaskViewSet
-from vendors.views import ApplicationViewSet, HealthView, VendorViewSet
+from vendors.views import ApplicationLineViewSet, ApplicationViewSet, HealthView, VendorViewSet
 
 router = DefaultRouter()
 router.register('vendors', VendorViewSet, basename='vendor')
 router.register('applications', ApplicationViewSet, basename='application')
+router.register('application-lines', ApplicationLineViewSet, basename='application-line')
 router.register('tasks', TaskViewSet, basename='task')
 router.register('users', UserViewSet, basename='user')
+router.register('market-weekends', MarketWeekendViewSet, basename='market-weekend')
 
 api_v1 = [
     path('health/', HealthView.as_view(), name='health'),

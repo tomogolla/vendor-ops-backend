@@ -56,18 +56,26 @@ class CsvImportTests(ApiTestCase):
         batch = ImportBatch.objects.get(pk=summary['batch_id'])
         self.assertEqual(batch.intake_events.count(), 5)
 
+        # Changed in v1.3: every imported row is an applicant with an application at NEW.
+        self.assertEqual((summary['applications_created'], summary['applications_bundled']), (4, 1))
         juniper = Vendor.objects.get(brand_name='Juniper')
-        self.assertEqual(juniper.display_status, 'lead')
+        self.assertEqual(juniper.display_status, 'applied')
+        application = juniper.applications.get()
+        self.assertEqual((application.stage, application.source), ('NEW', 'CSV import'))
         self.assertEqual(juniper.tasks.get().task_type, Task.TaskType.DISCOVERY_CALL)
+        self.assertEqual(juniper.tasks.get().application, application)
         self.assertTrue(juniper.activity.filter(event_type=ActivityEvent.EventType.LEAD_IMPORTED).exists())
         for name in ('Called Before', 'Dormant', 'Opted Out'):
             self.assertFalse(Vendor.objects.get(brand_name=name).tasks.exists(), name)
+            self.assertEqual(Vendor.objects.get(brand_name=name).applications.get().stage, 'NEW', name)
         self.assertFalse(Vendor.objects.get(brand_name='Dormant').is_active)
         self.assertTrue(Vendor.objects.get(brand_name='Opted Out').outreach_opt_out)
 
         acme = Vendor.objects.get(pk=self.acme['id'])
         self.assertEqual(acme.intake_events.filter(source_type=LeadIntakeEvent.SourceType.CSV_IMPORT).count(), 1)
         self.assertEqual(acme.tasks.count(), 1, 'matched rows do not add call tasks')
+        self.assertEqual(acme.applications.count(), 1, 'the matched row was bundled into the open application')
+        self.assertTrue(acme.activity.filter(event_type=ActivityEvent.EventType.APPLICATION_BUNDLED).exists())
 
     def test_possible_duplicates_import_only_when_included(self):
         summary = self.upload('/api/v1/imports/vendors/confirm/', include_lines=['5']).json()

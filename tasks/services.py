@@ -134,4 +134,8 @@ def log_call(
         call_details=task.call_details,
         callback_at=callback_at.isoformat() if callback_at else None,
     )
+    if task.task_type == Task.TaskType.DISCOVERY_CALL and task.application_id:
+        from vendors.pipeline import advance_after_call_attempt  # vendors.pipeline imports this module
+
+        advance_after_call_attempt(task.application, actor)
     return task

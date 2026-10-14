@@ -2,9 +2,11 @@ from rest_framework import serializers
 
 from accounts.models import User
 from accounts.serializers import UserSummarySerializer
+from catalog.models import AddOn, BoothVariant
 from tasks.models import Task
 
-from .models import ActivityEvent, Application, InternalNote, Vendor
+from .models import ActivityEvent, Application, ApplicationLine, InternalNote, Vendor
+from .pipeline import application_totals, exhausted_calls
 from .services import MatchResult
 
 VENDOR_EDITABLE_FIELDS = [
@@ -40,6 +42,7 @@ class CallSummarySerializer(serializers.Serializer):
 
 class VendorSerializer(serializers.ModelSerializer):
     status = serializers.CharField(source='display_status', read_only=True)
+    label = serializers.CharField(read_only=True)
     owner = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.filter(is_active=True), allow_null=True, required=False
     )
@@ -54,7 +57,7 @@ class VendorSerializer(serializers.ModelSerializer):
             'id', 'created_at', 'updated_at', 'created_by', 'owner', 'owner_detail',
             *VENDOR_EDITABLE_FIELDS,
             'journey_stage', 'qualification_status', 'application_status_summary',
-            'is_active', 'outreach_opt_out', 'status', 'call',
+            'is_active', 'outreach_opt_out', 'status', 'label', 'call',
         ]
         read_only_fields = [
             'id', 'created_at', 'updated_at', 'journey_stage', 'qualification_status', 'application_status_summary',
@@ -113,6 +116,65 @@ class QualificationChangeSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
 
 
+class ApplicationLineSerializer(serializers.ModelSerializer):
+    variant = serializers.PrimaryKeyRelatedField(
+        queryset=BoothVariant.objects.select_related('weekend'), allow_null=True, required=False,
+    )
+    add_on = serializers.PrimaryKeyRelatedField(
+        queryset=AddOn.objects.select_related('weekend'), allow_null=True, required=False,
+    )
+    parent_line = serializers.PrimaryKeyRelatedField(
+        queryset=ApplicationLine.objects.select_related('variant'), allow_null=True, required=False,
+    )
+    quantity = serializers.IntegerField(min_value=1, required=False, default=1)
+    kind = serializers.SerializerMethodField()
+    product_name = serializers.SerializerMethodField()
+    weekend = serializers.SerializerMethodField()
+    total_cents = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ApplicationLine
+        fields = [
+            'id', 'application', 'kind', 'variant', 'add_on', 'parent_line', 'product_name', 'weekend',
+            'quantity', 'unit_price_cents', 'total_cents', 'status', 'status_reason',
+            'waitlisted_at', 'confirmed_at', 'closed_at', 'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'application', 'unit_price_cents', 'status', 'status_reason',
+            'waitlisted_at', 'confirmed_at', 'closed_at', 'created_at', 'updated_at',
+        ]
+
+    def get_kind(self, line):
+        return 'booth' if line.variant_id else 'add_on'
+
+    def get_product_name(self, line):
+        return line.product.name
+
+    def get_weekend(self, line):
+        weekend = line.weekend
+        return {'id': str(weekend.pk), 'label': weekend.label, 'start_date': weekend.start_date}
+
+
+class SubmittedAddOnSerializer(serializers.Serializer):
+    add_on = serializers.PrimaryKeyRelatedField(queryset=AddOn.objects.select_related('weekend'))
+    quantity = serializers.IntegerField(min_value=1, default=1)
+
+
+class SubmittedLineSerializer(serializers.Serializer):
+    """A booth requested with a submission, optionally with add-ons for that booth."""
+    variant = serializers.PrimaryKeyRelatedField(queryset=BoothVariant.objects.select_related('weekend'))
+    quantity = serializers.IntegerField(min_value=1, default=1)
+    add_ons = SubmittedAddOnSerializer(many=True, required=False, default=list)
+
+
+class LineDecisionSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=2000, default='')
+
+
+class PaymentNoteSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True, max_length=2000, default='')
+
+
 class ApplicationSerializer(serializers.ModelSerializer):
     vendor = serializers.PrimaryKeyRelatedField(queryset=Vendor.objects.all(), required=False)
     vendor_detail = VendorSummarySerializer(source='vendor', read_only=True)
@@ -121,18 +183,72 @@ class ApplicationSerializer(serializers.ModelSerializer):
         queryset=User.objects.filter(is_active=True), allow_null=True, required=False
     )
     submitted_by = UserSummarySerializer(read_only=True)
+    # DEPRECATED (v1.3): derived from `stage` for the current frontend.
+    status = serializers.CharField(source='derived_status', read_only=True)
+    lines = ApplicationLineSerializer(many=True, read_only=True)
+    requested_lines = SubmittedLineSerializer(many=True, write_only=True, required=False)
+    notes = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=5000)
+    call_exhausted = serializers.SerializerMethodField(
+        help_text='The call task closed after the last allowed No Answer; what happens next is undecided.'
+    )
+    vendor_brand = serializers.CharField(source='vendor.brand_name', read_only=True)
+    vendor_label = serializers.SerializerMethodField()
+    has_waitlisted_lines = serializers.SerializerMethodField()
+    call_attempts = serializers.SerializerMethodField()
+    next_task_due_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Application
         fields = [
-            'id', 'vendor', 'vendor_detail', 'vendor_data', 'submitted_by', 'source', 'submitted_at', 'status',
+            'id', 'vendor', 'vendor_brand', 'vendor_label', 'vendor_detail', 'vendor_data', 'requested_lines', 'notes',
+            'submitted_by', 'source', 'submitted_at', 'stage', 'stage_entered_at',
+            'has_waitlisted_lines', 'call_exhausted', 'call_attempts', 'next_task_due_at', 'status', 'legacy_status',
             'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
             'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
+            'lines', 'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
             'decision', 'decision_reason', 'decided_at', 'updated_at',
         ]
         read_only_fields = [
-            'id', 'submitted_by', 'submitted_at', 'social_snapshot', 'decision', 'decided_at', 'updated_at',
+            'id', 'submitted_by', 'submitted_at', 'social_snapshot', 'stage', 'stage_entered_at', 'legacy_status',
+            'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
+            'decision', 'decided_at', 'updated_at',
         ]
+
+    def get_call_exhausted(self, application) -> bool:
+        annotated = getattr(application, 'call_exhausted', None)
+        if annotated is not None:
+            return annotated
+        return exhausted_calls().filter(application=application).exists()
+
+    # The fallbacks below run only for an application not loaded through ApplicationViewSet.get_queryset.
+
+    def get_vendor_label(self, application) -> str:
+        return getattr(application, 'vendor_label', None) or application.vendor.label
+
+    def get_has_waitlisted_lines(self, application) -> bool:
+        annotated = getattr(application, 'has_waitlisted_lines', None)
+        if annotated is not None:
+            return annotated
+        return any(line.status == ApplicationLine.Status.WAITLISTED for line in application.lines.all())
+
+    def get_call_attempts(self, application) -> int:
+        annotated = getattr(application, 'call_attempts', None)
+        if annotated is not None:
+            return annotated
+        return sum(application.tasks.filter(task_type=Task.TaskType.DISCOVERY_CALL).values_list('attempt_count', flat=True))
+
+    def get_next_task_due_at(self, application):
+        if hasattr(application, 'next_task_due_at'):
+            return application.next_task_due_at
+        task = application.tasks.filter(status__in=Task.OPEN_STATUSES, due_at__isnull=False).order_by('due_at').first()
+        return task.due_at if task else None
+
+    def to_representation(self, application):
+        """Adds currency, requested_total_cents, confirmed_subtotal_cents, discount_cents and
+        confirmed_total_cents, computed from the (prefetched) lines."""
+        data = super().to_representation(application)
+        data.update(application_totals(application, list(application.lines.all())))
+        return data
 
     def validate(self, attrs):
         if self.instance is None and not attrs.get('vendor') and not attrs.get('vendor_data'):
@@ -143,8 +259,20 @@ class ApplicationSerializer(serializers.ModelSerializer):
 
 
 class ApplicationStatusChangeSerializer(serializers.Serializer):
+    """DEPRECATED (v1.3): PATCH /applications/{id}/ with `status`; use the stage endpoint."""
     status = serializers.ChoiceField(choices=Application.Status.choices)
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class ApplicationStageChangeSerializer(serializers.Serializer):
+    stage = serializers.ChoiceField(choices=Application.Stage.choices)
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class DiscountSerializer(serializers.Serializer):
+    discount_type = serializers.ChoiceField(choices=Application.DiscountType.choices)
+    discount_value = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=0)
+    discount_label = serializers.CharField(required=False, allow_blank=True, max_length=100, default='')
 
 
 class InternalNoteSerializer(serializers.ModelSerializer):

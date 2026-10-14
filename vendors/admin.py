@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import ActivityEvent, Application, InternalNote, LeadIntakeEvent, Vendor
+from .models import ActivityEvent, Application, ApplicationLine, InternalNote, LeadIntakeEvent, Vendor
 
 
 class IntakeInline(admin.TabularInline):
@@ -28,10 +28,25 @@ class LeadIntakeEventAdmin(admin.ModelAdmin):
     search_fields = ['vendor__brand_name']
 
 
+class ApplicationLineInline(admin.TabularInline):
+    """Read-only: line changes go through vendors.pipeline so capacity and activity stay correct."""
+    model = ApplicationLine
+    fk_name = 'application'
+    extra = 0
+    can_delete = False
+    fields = ['variant', 'add_on', 'parent_line', 'quantity', 'unit_price_cents', 'status', 'status_reason',
+              'waitlisted_at', 'confirmed_at', 'closed_at']
+    readonly_fields = fields
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(Application)
 class ApplicationAdmin(admin.ModelAdmin):
-    list_display = ['vendor', 'status', 'reviewer', 'source', 'submitted_at', 'decided_at']
-    list_filter = ['status', 'source']
+    inlines = [ApplicationLineInline]
+    list_display = ['vendor', 'stage', 'stage_entered_at', 'reviewer', 'source', 'submitted_at', 'billed_at']
+    list_filter = ['stage', 'source']
     search_fields = ['vendor__brand_name']
     autocomplete_fields = ['vendor', 'reviewer']
 

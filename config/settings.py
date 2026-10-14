@@ -35,6 +35,7 @@ INSTALLED_APPS = [
     'django_filters',
     'corsheaders',
     'accounts',
+    'catalog',
     'vendors',
     'tasks',
     'imports',
@@ -136,6 +137,8 @@ BUSINESS_HOURS = {
 }
 DISCOVERY_CALL_DUE_BUSINESS_HOURS = env('DISCOVERY_CALL_DUE_BUSINESS_HOURS')
 MAX_CALL_ATTEMPTS = 5
+# Money is stored as integer cents (`*_cents`); the currency code is for display only.
+CURRENCY = 'USD'
 
 LOGGING = {
     'version': 1,

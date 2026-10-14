@@ -1,7 +1,9 @@
-from django.db.models import Prefetch
+from django.db.models import Count, Exists, F, OuterRef, Prefetch, Subquery, Sum
+from django.db.models.functions import Coalesce
+from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -9,20 +11,36 @@ from rest_framework.views import APIView
 from accounts.permissions import IsAdministrator, is_admin
 from tasks.models import Task
 
-from . import services
+from . import pipeline, services
 from .filters import ApplicationFilter, VendorFilter
-from .models import Application, Vendor
+from .models import Application, ApplicationLine, Vendor, vendor_label_expression
 from .serializers import (
     VENDOR_EDITABLE_FIELDS,
     ActivityEventSerializer,
+    ApplicationLineSerializer,
     ApplicationSerializer,
+    ApplicationStageChangeSerializer,
     ApplicationStatusChangeSerializer,
+    DiscountSerializer,
     InternalNoteSerializer,
+    LineDecisionSerializer,
+    PaymentNoteSerializer,
     QualificationChangeSerializer,
     VendorSerializer,
     VendorStatusChangeSerializer,
     match_payload,
 )
+
+LINES_QUERYSET = ApplicationLine.objects.select_related('variant__weekend', 'add_on__weekend')
+
+DISCOUNT_FIELDS = {'discount_type', 'discount_value', 'discount_label'}
+# DEPRECATED (v1.3): legacy status values accepted by PATCH /applications/{id}/.
+LEGACY_STATUS_TO_STAGE = {
+    Application.Status.SUBMITTED: Application.Stage.NEW,
+    Application.Status.IN_REVIEW: Application.Stage.IN_REVIEW,
+    Application.Status.DECLINED: Application.Stage.DECLINED,
+    Application.Status.WITHDRAWN: Application.Stage.WITHDRAWN,
+}
 
 
 class HealthView(APIView):
@@ -52,7 +70,7 @@ class VendorViewSet(
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
-        return Vendor.objects.select_related('owner', 'created_by').prefetch_related(
+        return Vendor.objects.with_label().select_related('owner', 'created_by').prefetch_related(
             Prefetch(
                 'tasks',
                 queryset=Task.objects.filter(task_type=Task.TaskType.DISCOVERY_CALL).order_by('-created_at'),
@@ -143,19 +161,59 @@ class ApplicationViewSet(
 ):
     serializer_class = ApplicationSerializer
     filterset_class = ApplicationFilter
-    ordering_fields = ['submitted_at', 'updated_at']
+    ordering_fields = ['submitted_at', 'updated_at', 'stage_entered_at', 'billed_at']
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
-        return Application.objects.select_related('vendor', 'reviewer', 'submitted_by')
+        calls = Task.objects.filter(application=OuterRef('pk'), task_type=Task.TaskType.DISCOVERY_CALL)
+        open_tasks = Task.objects.filter(application=OuterRef('pk'), status__in=Task.OPEN_STATUSES, due_at__isnull=False)
+        return Application.objects.select_related('vendor', 'reviewer', 'submitted_by').prefetch_related(
+            Prefetch('lines', queryset=LINES_QUERYSET),
+        ).annotate(
+            call_exhausted=Exists(pipeline.exhausted_calls().filter(application=OuterRef('pk'))),
+            call_attempts=Coalesce(
+                Subquery(calls.values('application').annotate(total=Sum('attempt_count')).values('total')), 0,
+            ),
+            next_task_due_at=Subquery(open_tasks.order_by('due_at').values('due_at')[:1]),
+            has_waitlisted_lines=Exists(ApplicationLine.objects.filter(
+                application=OuterRef('pk'), status=ApplicationLine.Status.WAITLISTED,
+            )),
+            vendor_label=vendor_label_expression('vendor__'),
+        )
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """Counts per stage (respecting the list filters) and the oldest applications awaiting payment."""
+        applications = self.filter_queryset(Application.objects.all())
+        counts = dict(applications.values_list('stage').annotate(count=Count('id')).order_by())
+        now = timezone.now()
+        awaiting = (
+            Application.objects.filter(stage=Application.Stage.AWAITING_PAYMENT).select_related('vendor')
+            .order_by(F('billed_at').asc(nulls_first=True), 'submitted_at')[:10]
+        )
+        return Response({
+            'stages': {stage: counts.get(stage, 0) for stage in Application.Stage.values},
+            'oldest_awaiting_payment': [
+                {
+                    'id': str(application.pk), 'brand_name': application.vendor.brand_name,
+                    'billed_at': application.billed_at,
+                    'days_since_billed': (now - application.billed_at).days if application.billed_at else None,
+                }
+                for application in awaiting
+            ],
+        })
 
     def create(self, request, *args, **kwargs):
+        """+Add vendor: looks the vendor up (or creates it) and submits. A submission for a vendor
+        with an application at NEW or IN_REVIEW is bundled into it and answered with 200."""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
         vendor = data.pop('vendor', None)
         raw_vendor_data = data.pop('vendor_data', None)
-        if data.pop('status', None) not in (None, Application.Status.SUBMITTED):
+        requested_lines = data.pop('requested_lines', [])
+        notes = data.pop('notes', '')
+        if request.data.get('status') not in (None, Application.Status.SUBMITTED) or request.data.get('stage'):
             raise PermissionDenied('New applications start as submitted.')
         reviewer = data.pop('reviewer', None)
         if reviewer is not None and not is_admin(request.user):
@@ -171,6 +229,7 @@ class ApplicationViewSet(
             application = services.submit_application(
                 actor=request.user, vendor=vendor, vendor_data=vendor_data,
                 application_data={**data, 'reviewer': reviewer} if reviewer else data, source=source,
+                lines=requested_lines, notes=notes,
             )
         except services.AmbiguousVendorMatch as ambiguous:
             return Response(
@@ -178,25 +237,132 @@ class ApplicationViewSet(
                  'code': 'ambiguous_vendor', **match_payload(ambiguous.result)},
                 status=status.HTTP_409_CONFLICT,
             )
-        return Response(self.get_serializer(application).data, status=status.HTTP_201_CREATED)
+        body = {**self.get_serializer(self.get_queryset().get(pk=application.pk)).data, 'bundled': application.bundled}
+        return Response(body, status=status.HTTP_200_OK if application.bundled else status.HTTP_201_CREATED)
 
     def partial_update(self, request, *args, **kwargs):
         application = self.get_object()
-        protected = {'status', 'reviewer', 'decision_reason'} & request.data.keys()
+        protected = {'status', 'reviewer', 'decision_reason', *DISCOUNT_FIELDS} & request.data.keys()
         if protected and not is_admin(request.user):
-            raise PermissionDenied('Only administrators can change status, reviewer or decision.')
+            raise PermissionDenied('Only administrators can change status, reviewer, decision or discount.')
         if 'status' in request.data:
+            # DEPRECATED (v1.3): legacy status writes are translated onto stages.
             change = ApplicationStatusChangeSerializer(
                 data={'status': request.data['status'], 'reason': request.data.get('decision_reason', '')}
             )
             change.is_valid(raise_exception=True)
-            if change.validated_data['status'] != application.status:
-                services.change_application_status(
-                    application, change.validated_data['status'], actor=request.user,
+            new_status = change.validated_data['status']
+            if new_status != application.derived_status:
+                if new_status in (Application.Status.APPROVED, Application.Status.WAITLISTED):
+                    raise services.UseLineDecisions()
+                pipeline.change_application_stage(
+                    application, LEGACY_STATUS_TO_STAGE[new_status], request.user,
                     reason=change.validated_data.get('reason', ''),
                 )
-        data = {k: v for k, v in request.data.items() if k not in {'status', 'decision_reason', 'vendor_data'}}
+        if DISCOUNT_FIELDS & request.data.keys():
+            discount = DiscountSerializer(data={
+                'discount_type': request.data.get('discount_type', application.discount_type),
+                'discount_value': request.data.get('discount_value', application.discount_value),
+                'discount_label': request.data.get('discount_label', application.discount_label),
+            })
+            discount.is_valid(raise_exception=True)
+            pipeline.set_discount(
+                application, actor=request.user, discount_type=discount.validated_data['discount_type'],
+                value=discount.validated_data['discount_value'], label=discount.validated_data['discount_label'],
+            )
+        skip = {'status', 'decision_reason', 'vendor_data', 'requested_lines', 'notes', *DISCOUNT_FIELDS}
+        data = {k: v for k, v in request.data.items() if k not in skip}
         serializer = self.get_serializer(application, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)
+
+    @action(detail=True, methods=['get', 'post'])
+    def lines(self, request, pk=None):
+        """Any authenticated user may list and request lines; administrators decide them."""
+        application = self.get_object()
+        if request.method == 'POST':
+            serializer = ApplicationLineSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+            line = pipeline.add_line(
+                application, actor=request.user, variant=data.get('variant'), add_on=data.get('add_on'),
+                parent_line=data.get('parent_line'), quantity=data.get('quantity', 1),
+            )
+            return Response(ApplicationLineSerializer(LINES_QUERYSET.get(pk=line.pk)).data, status=status.HTTP_201_CREATED)
+        return Response(ApplicationLineSerializer(LINES_QUERYSET.filter(application=application), many=True).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator], url_path='mark-billed')
+    def mark_billed(self, request, pk=None):
+        """TODO(invoicing): placeholder until invoicing lands."""
+        pipeline.mark_billed(self.get_object(), actor=request.user)
+        return Response(self.get_serializer(self.get_queryset().get(pk=pk)).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator], url_path='mark-first-payment')
+    def mark_first_payment(self, request, pk=None):
+        """TODO(invoicing): placeholder until payments come from Stripe or Shopify."""
+        serializer = PaymentNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pipeline.mark_first_payment(self.get_object(), actor=request.user, note=serializer.validated_data['note'])
+        return Response(self.get_serializer(self.get_queryset().get(pk=pk)).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def stage(self, request, pk=None):
+        application = self.get_object()
+        serializer = ApplicationStageChangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pipeline.change_application_stage(
+            application, serializer.validated_data['stage'], request.user,
+            reason=serializer.validated_data.get('reason', ''),
+        )
+        return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)
+
+
+class ApplicationLineViewSet(
+    mixins.RetrieveModelMixin, mixins.UpdateModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet,
+):
+    """PATCH and DELETE only while REQUESTED (any authenticated user); decisions are administrator actions."""
+
+    serializer_class = ApplicationLineSerializer
+    queryset = LINES_QUERYSET
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def partial_update(self, request, *args, **kwargs):
+        line = self.get_object()
+        unknown = set(request.data.keys()) - {'quantity'}
+        if unknown:
+            raise ValidationError({key: 'Only the quantity of a requested line can be changed.' for key in sorted(unknown)})
+        serializer = self.get_serializer(line, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        pipeline.update_line(line, actor=request.user, quantity=serializer.validated_data.get('quantity', line.quantity))
+        return Response(self.get_serializer(self.get_queryset().get(pk=line.pk)).data)
+
+    def perform_destroy(self, instance):
+        pipeline.remove_line(instance, actor=self.request.user)
+
+    def _decide(self, request, decide, **kwargs):
+        line = self.get_object()
+        decide(line, actor=request.user, **kwargs)
+        return Response(self.get_serializer(self.get_queryset().get(pk=line.pk)).data)
+
+    def _reason(self, request) -> str:
+        serializer = LineDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data['reason']
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def confirm(self, request, pk=None):
+        return self._decide(request, pipeline.confirm_line)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def waitlist(self, request, pk=None):
+        return self._decide(request, pipeline.waitlist_line, reason=self._reason(request))
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def decline(self, request, pk=None):
+        return self._decide(request, pipeline.decline_line, reason=self._reason(request))
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def release(self, request, pk=None):
+        """Release hold: a confirmed line gives its capacity back. A reason is required."""
+        return self._decide(request, pipeline.release_line, reason=self._reason(request))
