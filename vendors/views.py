@@ -9,20 +9,31 @@ from rest_framework.views import APIView
 from accounts.permissions import IsAdministrator, is_admin
 from tasks.models import Task
 
-from . import services
+from . import pipeline, services
 from .filters import ApplicationFilter, VendorFilter
 from .models import Application, Vendor
 from .serializers import (
     VENDOR_EDITABLE_FIELDS,
     ActivityEventSerializer,
     ApplicationSerializer,
+    ApplicationStageChangeSerializer,
     ApplicationStatusChangeSerializer,
+    DiscountSerializer,
     InternalNoteSerializer,
     QualificationChangeSerializer,
     VendorSerializer,
     VendorStatusChangeSerializer,
     match_payload,
 )
+
+DISCOUNT_FIELDS = {'discount_type', 'discount_value', 'discount_label'}
+# DEPRECATED (v1.3): legacy status values accepted by PATCH /applications/{id}/.
+LEGACY_STATUS_TO_STAGE = {
+    Application.Status.SUBMITTED: Application.Stage.NEW,
+    Application.Status.IN_REVIEW: Application.Stage.IN_REVIEW,
+    Application.Status.DECLINED: Application.Stage.DECLINED,
+    Application.Status.WITHDRAWN: Application.Stage.WITHDRAWN,
+}
 
 
 class HealthView(APIView):
@@ -155,7 +166,7 @@ class ApplicationViewSet(
         data = dict(serializer.validated_data)
         vendor = data.pop('vendor', None)
         raw_vendor_data = data.pop('vendor_data', None)
-        if data.pop('status', None) not in (None, Application.Status.SUBMITTED):
+        if request.data.get('status') not in (None, Application.Status.SUBMITTED) or request.data.get('stage'):
             raise PermissionDenied('New applications start as submitted.')
         reviewer = data.pop('reviewer', None)
         if reviewer is not None and not is_admin(request.user):
@@ -182,21 +193,48 @@ class ApplicationViewSet(
 
     def partial_update(self, request, *args, **kwargs):
         application = self.get_object()
-        protected = {'status', 'reviewer', 'decision_reason'} & request.data.keys()
+        protected = {'status', 'reviewer', 'decision_reason', *DISCOUNT_FIELDS} & request.data.keys()
         if protected and not is_admin(request.user):
-            raise PermissionDenied('Only administrators can change status, reviewer or decision.')
+            raise PermissionDenied('Only administrators can change status, reviewer, decision or discount.')
         if 'status' in request.data:
+            # DEPRECATED (v1.3): legacy status writes are translated onto stages.
             change = ApplicationStatusChangeSerializer(
                 data={'status': request.data['status'], 'reason': request.data.get('decision_reason', '')}
             )
             change.is_valid(raise_exception=True)
-            if change.validated_data['status'] != application.status:
-                services.change_application_status(
-                    application, change.validated_data['status'], actor=request.user,
+            new_status = change.validated_data['status']
+            if new_status != application.derived_status:
+                if new_status in (Application.Status.APPROVED, Application.Status.WAITLISTED):
+                    raise services.UseLineDecisions()
+                pipeline.change_application_stage(
+                    application, LEGACY_STATUS_TO_STAGE[new_status], request.user,
                     reason=change.validated_data.get('reason', ''),
                 )
-        data = {k: v for k, v in request.data.items() if k not in {'status', 'decision_reason', 'vendor_data'}}
+        if DISCOUNT_FIELDS & request.data.keys():
+            discount = DiscountSerializer(data={
+                'discount_type': request.data.get('discount_type', application.discount_type),
+                'discount_value': request.data.get('discount_value', application.discount_value),
+                'discount_label': request.data.get('discount_label', application.discount_label),
+            })
+            discount.is_valid(raise_exception=True)
+            pipeline.set_discount(
+                application, actor=request.user, discount_type=discount.validated_data['discount_type'],
+                value=discount.validated_data['discount_value'], label=discount.validated_data['discount_label'],
+            )
+        skip = {'status', 'decision_reason', 'vendor_data', *DISCOUNT_FIELDS}
+        data = {k: v for k, v in request.data.items() if k not in skip}
         serializer = self.get_serializer(application, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
+    def stage(self, request, pk=None):
+        application = self.get_object()
+        serializer = ApplicationStageChangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pipeline.change_application_stage(
+            application, serializer.validated_data['stage'], request.user,
+            reason=serializer.validated_data.get('reason', ''),
+        )
         return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)

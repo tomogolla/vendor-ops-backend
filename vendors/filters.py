@@ -8,12 +8,17 @@ from .models import Application, Vendor
 Stage = Vendor.JourneyStage
 AppStatus = Application.Status
 
+# DEPRECATED (v1.3): mirrors Vendor.display_status. 'waitlisted' no longer exists as a vendor
+# status (waitlisting is per line) and matches nothing.
 DISPLAY_STATUS_QUERIES = {
     'lead': Q(journey_stage=Stage.LEAD) & ~Q(qualification_status=Vendor.Qualification.NOT_QUALIFIED),
     'applied': Q(journey_stage=Stage.APPLICANT, application_status_summary=AppStatus.SUBMITTED),
-    'in_review': Q(journey_stage=Stage.APPLICANT, application_status_summary=AppStatus.IN_REVIEW),
-    'waitlisted': Q(journey_stage=Stage.APPLICANT, application_status_summary=AppStatus.WAITLISTED),
-    'approved': Q(journey_stage=Stage.APPROVED),
+    'in_review': Q(
+        journey_stage=Stage.APPLICANT, application_status_summary__in=[AppStatus.IN_REVIEW, AppStatus.WAITLISTED],
+    ),
+    'waitlisted': Q(pk__in=[]),
+    'approved': Q(journey_stage=Stage.APPROVED)
+    | Q(journey_stage=Stage.APPLICANT, application_status_summary=AppStatus.APPROVED),
     'suspended': Q(journey_stage=Stage.SUSPENDED),
     'declined': Q(journey_stage=Stage.LEAD, qualification_status=Vendor.Qualification.NOT_QUALIFIED)
     | Q(journey_stage=Stage.APPLICANT, application_status_summary__in=[AppStatus.DECLINED, AppStatus.WITHDRAWN]),

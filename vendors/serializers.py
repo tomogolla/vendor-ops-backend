@@ -121,17 +121,23 @@ class ApplicationSerializer(serializers.ModelSerializer):
         queryset=User.objects.filter(is_active=True), allow_null=True, required=False
     )
     submitted_by = UserSummarySerializer(read_only=True)
+    # DEPRECATED (v1.3): derived from `stage` for the current frontend.
+    status = serializers.CharField(source='derived_status', read_only=True)
 
     class Meta:
         model = Application
         fields = [
-            'id', 'vendor', 'vendor_detail', 'vendor_data', 'submitted_by', 'source', 'submitted_at', 'status',
+            'id', 'vendor', 'vendor_detail', 'vendor_data', 'submitted_by', 'source', 'submitted_at',
+            'stage', 'stage_entered_at', 'status', 'legacy_status',
             'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
             'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
+            'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
             'decision', 'decision_reason', 'decided_at', 'updated_at',
         ]
         read_only_fields = [
-            'id', 'submitted_by', 'submitted_at', 'social_snapshot', 'decision', 'decided_at', 'updated_at',
+            'id', 'submitted_by', 'submitted_at', 'social_snapshot', 'stage', 'stage_entered_at', 'legacy_status',
+            'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
+            'decision', 'decided_at', 'updated_at',
         ]
 
     def validate(self, attrs):
@@ -143,8 +149,20 @@ class ApplicationSerializer(serializers.ModelSerializer):
 
 
 class ApplicationStatusChangeSerializer(serializers.Serializer):
+    """DEPRECATED (v1.3): PATCH /applications/{id}/ with `status`; use the stage endpoint."""
     status = serializers.ChoiceField(choices=Application.Status.choices)
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class ApplicationStageChangeSerializer(serializers.Serializer):
+    stage = serializers.ChoiceField(choices=Application.Stage.choices)
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class DiscountSerializer(serializers.Serializer):
+    discount_type = serializers.ChoiceField(choices=Application.DiscountType.choices)
+    discount_value = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=0)
+    discount_label = serializers.CharField(required=False, allow_blank=True, max_length=100, default='')
 
 
 class InternalNoteSerializer(serializers.ModelSerializer):

@@ -176,16 +176,22 @@ class ApplicationSubmissionTests(ApiTestCase):
 
 
 class StatusTests(ApiTestCase):
+    # Changed in v1.3: 'approved' is no longer a status transition (lines are confirmed and the
+    # application billed instead), so the legacy endpoint answers 400. Suspend and reinstate still work.
     def test_admin_decision_completes_review_and_updates_vendor(self):
+        from .pipeline import move_stage
+
         vendor = self.lead()
         admin = self.as_user(self.admin)
         url = f"/api/v1/vendors/{vendor['id']}/status/"
         self.assertEqual(admin.post(url, {'status': 'applied'}).json()['status'], 'applied')
         self.assertEqual(admin.post(url, {'status': 'in_review'}).json()['status'], 'in_review')
-        self.assertEqual(admin.post(url, {'status': 'approved', 'note': 'Great fit'}).json()['status'], 'approved')
-        review = Task.objects.get(vendor_id=vendor['id'], task_type=Task.TaskType.APPLICATION_REVIEW)
-        self.assertEqual((review.status, review.outcome), (Task.Status.COMPLETED, 'Approved'))
+        response = admin.post(url, {'status': 'approved', 'note': 'Great fit'})
+        self.assertEqual((response.status_code, response.json()['code']), (400, 'use_line_decisions'))
+
         application = Application.objects.get(vendor_id=vendor['id'])
+        move_stage(application, Application.Stage.AWAITING_PAYMENT, actor=self.admin, reason='Great fit')
+        self.assertEqual(admin.get(f"/api/v1/vendors/{vendor['id']}/").json()['status'], 'approved')
         self.assertEqual((application.decision, application.decision_reason), ('APPROVED', 'Great fit'))
         self.assertEqual(admin.post(url, {'status': 'suspended'}).json()['status'], 'suspended')
         self.assertEqual(admin.post(url, {'status': 'approved'}).json()['status'], 'approved')
@@ -202,7 +208,8 @@ class StatusTests(ApiTestCase):
         self.assertEqual(admin.post(url, {'status': 'declined'}).json()['status'], 'declined')
         self.assertEqual(admin.post(url, {'status': 'in_review'}).json()['status'], 'in_review')
         events = set(ActivityEvent.objects.filter(vendor_id=vendor['id']).values_list('event_type', flat=True))
-        self.assertTrue({Event.QUALIFICATION_CHANGED, Event.APPLICATION_SUBMITTED, Event.APPLICATION_STATUS_CHANGED} <= events)
+        # Changed in v1.3: stage changes are logged as APPLICATION_STAGE_CHANGED.
+        self.assertTrue({Event.QUALIFICATION_CHANGED, Event.APPLICATION_SUBMITTED, Event.APPLICATION_STAGE_CHANGED} <= events)
 
 
 class FilterTests(ApiTestCase):

@@ -30,8 +30,8 @@ class LeadIntakeEventAdmin(admin.ModelAdmin):
 
 @admin.register(Application)
 class ApplicationAdmin(admin.ModelAdmin):
-    list_display = ['vendor', 'status', 'reviewer', 'source', 'submitted_at', 'decided_at']
-    list_filter = ['status', 'source']
+    list_display = ['vendor', 'stage', 'stage_entered_at', 'reviewer', 'source', 'submitted_at', 'billed_at']
+    list_filter = ['stage', 'source']
     search_fields = ['vendor__brand_name']
     autocomplete_fields = ['vendor', 'reviewer']
 
