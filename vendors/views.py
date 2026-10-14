@@ -22,6 +22,7 @@ from .serializers import (
     DiscountSerializer,
     InternalNoteSerializer,
     LineDecisionSerializer,
+    PaymentNoteSerializer,
     QualificationChangeSerializer,
     VendorSerializer,
     VendorStatusChangeSerializer,
@@ -67,7 +68,7 @@ class VendorViewSet(
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
-        return Vendor.objects.select_related('owner', 'created_by').prefetch_related(
+        return Vendor.objects.with_label().select_related('owner', 'created_by').prefetch_related(
             Prefetch(
                 'tasks',
                 queryset=Task.objects.filter(task_type=Task.TaskType.DISCOVERY_CALL).order_by('-created_at'),
@@ -256,6 +257,20 @@ class ApplicationViewSet(
             )
             return Response(ApplicationLineSerializer(LINES_QUERYSET.get(pk=line.pk)).data, status=status.HTTP_201_CREATED)
         return Response(ApplicationLineSerializer(LINES_QUERYSET.filter(application=application), many=True).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator], url_path='mark-billed')
+    def mark_billed(self, request, pk=None):
+        """TODO(invoicing): placeholder until invoicing lands."""
+        pipeline.mark_billed(self.get_object(), actor=request.user)
+        return Response(self.get_serializer(self.get_queryset().get(pk=pk)).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdministrator], url_path='mark-first-payment')
+    def mark_first_payment(self, request, pk=None):
+        """TODO(invoicing): placeholder until payments come from Stripe or Shopify."""
+        serializer = PaymentNoteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        pipeline.mark_first_payment(self.get_object(), actor=request.user, note=serializer.validated_data['note'])
+        return Response(self.get_serializer(self.get_queryset().get(pk=pk)).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsAdministrator])
     def stage(self, request, pk=None):

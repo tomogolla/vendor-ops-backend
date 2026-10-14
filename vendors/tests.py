@@ -188,7 +188,9 @@ class StatusTests(ApiTestCase):
     # Changed in v1.3: 'approved' is no longer a status transition (lines are confirmed and the
     # application billed instead), so the legacy endpoint answers 400. Suspend and reinstate still work.
     def test_admin_decision_completes_review_and_updates_vendor(self):
-        from .pipeline import move_stage
+        from catalog.models import BoothVariant, MarketWeekend
+
+        from .pipeline import add_line, confirm_line
 
         vendor = self.lead()
         admin = self.as_user(self.admin)
@@ -199,9 +201,15 @@ class StatusTests(ApiTestCase):
         self.assertEqual((response.status_code, response.json()['code']), (400, 'use_line_decisions'))
 
         application = Application.objects.get(vendor_id=vendor['id'])
-        move_stage(application, Application.Stage.AWAITING_PAYMENT, actor=self.admin, reason='Great fit')
+        weekend = MarketWeekend.objects.create(label='Oct 10 & 11', start_date='2026-10-10', end_date='2026-10-11')
+        variant = BoothVariant.objects.create(weekend=weekend, name='8ft x 8ft', price_cents=15000, capacity=5)
+        confirm_line(add_line(application, actor=self.admin, variant=variant), actor=self.admin)
+        self.assertEqual(admin.post(f'/api/v1/applications/{application.pk}/mark-billed/').status_code, 200)
         self.assertEqual(admin.get(f"/api/v1/vendors/{vendor['id']}/").json()['status'], 'approved')
-        self.assertEqual((application.decision, application.decision_reason), ('APPROVED', 'Great fit'))
+        review = Task.objects.get(vendor_id=vendor['id'], task_type=Task.TaskType.APPLICATION_REVIEW)
+        self.assertEqual((review.status, review.outcome), (Task.Status.COMPLETED, 'Billed'))
+        application.refresh_from_db()
+        self.assertEqual(application.decision, 'APPROVED')
         self.assertEqual(admin.post(url, {'status': 'suspended'}).json()['status'], 'suspended')
         self.assertEqual(admin.post(url, {'status': 'approved'}).json()['status'], 'approved')
 

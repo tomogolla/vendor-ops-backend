@@ -760,3 +760,77 @@ class BackfillTests(PipelineTestCase):
         out = StringIO()
         call_command('backfill_applications', stdout=out)
         self.assertIn('Created 0 application(s) at NEW and 0 at DECLINED', out.getvalue())
+
+
+class BillingStubTests(PipelineTestCase):
+    def post(self, application, action, user=None, **payload):
+        return self.as_user(user or self.admin).post(
+            f'/api/v1/applications/{application.pk}/{action}/', payload, format='json',
+        )
+
+    def test_mark_billed_needs_in_review_and_a_confirmed_line(self):
+        application = self.application()
+        line = self.line(application)
+        self.decide(line, 'confirm')
+        response = self.post(application, 'mark-billed')
+        self.assertEqual(response.status_code, 400, 'NEW cannot be billed')
+
+        pipeline.move_stage(application, Stage.IN_REVIEW, actor=self.admin)
+        other = self.at_stage(Stage.IN_REVIEW, **self.vendor_payload(2))
+        waiting = self.line(other, self.big_booth)
+        self.decide(waiting, 'waitlist')
+        response = self.post(other, 'mark-billed')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Confirm at least one line', response.json()['lines'])
+
+        self.assertEqual(self.post(application, 'mark-billed', user=self.member).status_code, 403)
+        body = self.post(application, 'mark-billed').json()
+        self.assertEqual(body['stage'], Stage.AWAITING_PAYMENT)
+        self.assertIsNotNone(body['billed_at'])
+        self.assertTrue(application.activity.filter(event_type=Event.APPLICATION_BILLED).exists())
+        self.assertFalse(application.tasks.filter(task_type=Task.TaskType.APPLICATION_REVIEW,
+                                                  status__in=Task.OPEN_STATUSES).exists())
+        self.assertEqual(self.post(application, 'mark-billed').status_code, 400, 'already billed')
+        vendor = Vendor.objects.get(pk=application.vendor_id)
+        self.assertEqual((vendor.label, vendor.journey_stage), ('prospect', 'APPLICANT'),
+                         'billing does not make the vendor active')
+
+    def test_mark_first_payment_wins_and_makes_the_vendor_active(self):
+        application = self.at_stage(Stage.IN_REVIEW)
+        self.decide(self.line(application), 'confirm')
+        self.assertEqual(self.post(application, 'mark-first-payment').status_code, 400, 'not billed yet')
+        self.post(application, 'mark-billed')
+        self.assertEqual(self.post(application, 'mark-first-payment', user=self.member).status_code, 403)
+        body = self.post(application, 'mark-first-payment', note='Paid by card').json()
+        self.assertEqual(body['stage'], Stage.WON)
+        self.assertIsNotNone(body['first_paid_at'])
+        event = application.activity.get(event_type=Event.APPLICATION_PAYMENT_RECEIVED)
+        self.assertEqual(event.metadata['note'], 'Paid by card')
+
+        vendor = self.as_user(self.member).get(f'/api/v1/vendors/{application.vendor_id}/').json()
+        self.assertEqual((vendor['label'], vendor['journey_stage'], vendor['status']), ('active', 'APPROVED', 'approved'))
+
+        line = application.lines.get()
+        self.assertEqual(self.decide(line, 'release', reason='Changed plans').status_code, 400)
+        self.assertEqual(self.request_line(application, variant=self.other_booth).status_code, 201,
+                         'a won vendor can request more weekends')
+
+
+class VendorLabelTests(PipelineTestCase):
+    def test_labels_and_filter(self):
+        prospect = self.application(**self.vendor_payload(1)).vendor
+        active = self.at_stage(Stage.WON, **self.vendor_payload(2)).vendor
+        inactive = self.application(**self.vendor_payload(3)).vendor
+        Vendor.objects.filter(pk=inactive.pk).update(is_active=False)
+        suspended = self.at_stage(Stage.WON, **self.vendor_payload(4)).vendor
+        Vendor.objects.filter(pk=suspended.pk).update(journey_stage=Vendor.JourneyStage.SUSPENDED, is_active=False)
+
+        expected = {prospect.pk: 'prospect', active.pk: 'active', inactive.pk: 'inactive', suspended.pk: 'suspended'}
+        for pk, label in expected.items():
+            self.assertEqual(Vendor.objects.get(pk=pk).label, label)
+            self.assertEqual(Vendor.objects.with_label().get(pk=pk).label, label)
+
+        client = self.as_user(self.member)
+        ids = lambda value: {v['id'] for v in client.get('/api/v1/vendors/', {'label': value}).json()['results']}  # noqa: E731
+        self.assertEqual(ids('active'), {str(active.pk)})
+        self.assertEqual(ids('inactive,suspended'), {str(inactive.pk), str(suspended.pk)})

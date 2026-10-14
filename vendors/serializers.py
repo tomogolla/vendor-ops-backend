@@ -42,6 +42,7 @@ class CallSummarySerializer(serializers.Serializer):
 
 class VendorSerializer(serializers.ModelSerializer):
     status = serializers.CharField(source='display_status', read_only=True)
+    label = serializers.CharField(read_only=True)
     owner = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.filter(is_active=True), allow_null=True, required=False
     )
@@ -56,7 +57,7 @@ class VendorSerializer(serializers.ModelSerializer):
             'id', 'created_at', 'updated_at', 'created_by', 'owner', 'owner_detail',
             *VENDOR_EDITABLE_FIELDS,
             'journey_stage', 'qualification_status', 'application_status_summary',
-            'is_active', 'outreach_opt_out', 'status', 'call',
+            'is_active', 'outreach_opt_out', 'status', 'label', 'call',
         ]
         read_only_fields = [
             'id', 'created_at', 'updated_at', 'journey_stage', 'qualification_status', 'application_status_summary',
@@ -168,6 +169,10 @@ class SubmittedLineSerializer(serializers.Serializer):
 
 class LineDecisionSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000, default='')
+
+
+class PaymentNoteSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True, max_length=2000, default='')
 
 
 class ApplicationSerializer(serializers.ModelSerializer):

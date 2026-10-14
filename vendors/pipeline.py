@@ -42,10 +42,12 @@ CLOSABLE_TASK_TYPES = (Task.TaskType.DISCOVERY_CALL, Task.TaskType.APPLICATION_R
 
 
 def sync_application_summary(vendor: Vendor):
-    """Keeps the deprecated vendor fields in step with the applications."""
+    """Keeps the deprecated vendor fields in step with the applications. The vendor becomes an
+    approved vendor once an application is WON (first payment), not when lines are confirmed."""
     latest = vendor.applications.order_by('-submitted_at').first()
     vendor.application_status_summary = latest.derived_status if latest else ''
-    if latest and latest.stage in BILLING_STAGES and vendor.journey_stage != Vendor.JourneyStage.SUSPENDED:
+    won = vendor.applications.filter(stage=Stage.WON).exists()
+    if won and vendor.journey_stage != Vendor.JourneyStage.SUSPENDED:
         vendor.journey_stage = Vendor.JourneyStage.APPROVED
     vendor.save(update_fields=['application_status_summary', 'journey_stage'])
 
@@ -421,6 +423,54 @@ def close_application_lines(application: Application, *, actor, reason: str, not
             verb='hold released' if released else 'cancelled',
         )
         _cascade_to_add_ons(line, actor=actor, reason=full_reason)
+
+
+# --- Billing and payment placeholders ------------------------------------------------
+
+@transaction.atomic
+def mark_billed(application: Application, *, actor) -> Application:
+    """TODO(invoicing): placeholder until invoicing, Stripe and Shopify arrive. Records that the
+    vendor was billed for the confirmed lines and moves the application to AWAITING_PAYMENT."""
+    _require_admin(actor, 'mark applications billed')
+    application = Application.objects.select_for_update(of=('self',)).select_related('vendor').get(pk=application.pk)
+    if application.stage != Stage.IN_REVIEW:
+        raise ValidationError({'stage': 'Only an application that is In review can be marked billed.'})
+    lines = list(ApplicationLine.objects.filter(application=application))
+    if not any(line.status == LineStatus.CONFIRMED for line in lines):
+        raise ValidationError({'lines': 'Confirm at least one line before billing.'})
+
+    now = timezone.now()
+    application.billed_at = now
+    application.save(update_fields=['billed_at', 'updated_at'])
+    record_activity(
+        application.vendor, Event.APPLICATION_BILLED, 'Application marked billed', actor=actor,
+        application=application, **application_totals(application, lines),
+    )
+    for task in Task.objects.filter(
+        application=application, task_type=Task.TaskType.APPLICATION_REVIEW, status__in=Task.OPEN_STATUSES,
+    ):
+        task.status = Task.Status.COMPLETED
+        task.completed_at = now
+        task.outcome = 'Billed'
+        task.save(update_fields=['status', 'completed_at', 'outcome', 'updated_at'])
+    return move_stage(application, Stage.AWAITING_PAYMENT, actor=actor, reason='Billed')
+
+
+@transaction.atomic
+def mark_first_payment(application: Application, *, actor, note='') -> Application:
+    """TODO(invoicing): placeholder until payments are recorded from Stripe or Shopify. The first
+    payment wins the application and makes the vendor Active."""
+    _require_admin(actor, 'record payments')
+    application = Application.objects.select_for_update(of=('self',)).select_related('vendor').get(pk=application.pk)
+    if application.stage != Stage.AWAITING_PAYMENT:
+        raise ValidationError({'stage': 'Only an application that is Awaiting payment can record a first payment.'})
+    application.first_paid_at = timezone.now()
+    application.save(update_fields=['first_paid_at', 'updated_at'])
+    record_activity(
+        application.vendor, Event.APPLICATION_PAYMENT_RECEIVED, 'First payment recorded', actor=actor,
+        application=application, note=note,
+    )
+    return move_stage(application, Stage.WON, actor=actor, reason=note or 'First payment received')
 
 
 # --- Totals --------------------------------------------------------------------------

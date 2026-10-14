@@ -35,6 +35,7 @@ def filter_owner(queryset, field, value, request):
 
 class VendorFilter(django_filters.FilterSet):
     status = django_filters.CharFilter(method='filter_status', help_text='Comma-separated display statuses.')
+    label = django_filters.CharFilter(method='filter_label', help_text='Comma-separated: prospect, active, inactive, suspended.')
     application_status = django_filters.CharFilter(field_name='application_status_summary')
     lead_source = django_filters.CharFilter(field_name='lead_source', lookup_expr='iexact')
     owner = django_filters.CharFilter(method='filter_owner', help_text='User id, "me" or "none".')
@@ -58,6 +59,12 @@ class VendorFilter(django_filters.FilterSet):
 
     def filter_owner(self, queryset, name, value):
         return filter_owner(queryset, 'owner', value, self.request)
+
+    def filter_label(self, queryset, name, value):
+        labels = [part.strip() for part in value.split(',') if part.strip()]
+        if 'label_value' not in queryset.query.annotations:
+            queryset = queryset.with_label()
+        return queryset.filter(label_value__in=labels)
 
     def filter_call(self, queryset, name, value):
         calls = Task.objects.filter(vendor=OuterRef('pk'), task_type=Task.TaskType.DISCOVERY_CALL)

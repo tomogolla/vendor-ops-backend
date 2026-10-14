@@ -8,8 +8,27 @@ from django.utils import timezone
 from .normalization import normalize_email, normalize_instagram, normalize_phone
 
 
+class VendorQuerySet(models.QuerySet):
+    def with_label(self):
+        """Annotates `label_value` (see Vendor.label) so lists can filter and sort on it."""
+        won = Application.objects.filter(vendor=models.OuterRef('pk'), stage=Application.Stage.WON)
+        return self.annotate(label_value=models.Case(
+            models.When(journey_stage=Vendor.JourneyStage.SUSPENDED, then=models.Value(Vendor.Label.SUSPENDED)),
+            models.When(is_active=False, then=models.Value(Vendor.Label.INACTIVE)),
+            models.When(models.Exists(won), then=models.Value(Vendor.Label.ACTIVE)),
+            default=models.Value(Vendor.Label.PROSPECT),
+            output_field=models.CharField(),
+        ))
+
+
 class Vendor(models.Model):
     """The permanent shared profile for a brand, from first lead onwards."""
+
+    class Label(models.TextChoices):
+        PROSPECT = 'prospect', 'Prospect'
+        ACTIVE = 'active', 'Active'
+        INACTIVE = 'inactive', 'Inactive'
+        SUSPENDED = 'suspended', 'Suspended'
 
     class JourneyStage(models.TextChoices):
         LEAD = 'LEAD', 'Lead'
@@ -70,12 +89,28 @@ class Vendor(models.Model):
         default=False, help_text='Excluded from outreach: no automatic call tasks.'
     )
 
+    objects = VendorQuerySet.as_manager()
+
     class Meta:
         ordering = ['-created_at']
         indexes = [models.Index(fields=['journey_stage', 'is_active'])]
 
     def __str__(self):
         return self.brand_name
+
+    @property
+    def label(self) -> str:
+        """suspended, inactive, active (any application WON) or prospect."""
+        annotated = getattr(self, 'label_value', None)
+        if annotated is not None:
+            return annotated
+        if self.journey_stage == self.JourneyStage.SUSPENDED:
+            return self.Label.SUSPENDED
+        if not self.is_active:
+            return self.Label.INACTIVE
+        if self.applications.filter(stage=Application.Stage.WON).exists():
+            return self.Label.ACTIVE
+        return self.Label.PROSPECT
 
     def save(self, *args, **kwargs):
         self.email_normalized = normalize_email(self.email)
@@ -357,6 +392,8 @@ class ActivityEvent(models.Model):
         APPLICATION_STATUS_CHANGED = 'APPLICATION_STATUS_CHANGED', 'Application status changed'  # pre-v1.3 history
         APPLICATION_STAGE_CHANGED = 'APPLICATION_STAGE_CHANGED', 'Application stage changed'
         APPLICATION_BUNDLED = 'APPLICATION_BUNDLED', 'Submission bundled into open application'
+        APPLICATION_BILLED = 'APPLICATION_BILLED', 'Application billed'
+        APPLICATION_PAYMENT_RECEIVED = 'APPLICATION_PAYMENT_RECEIVED', 'First payment received'
         APPLICATION_DISCOUNT_CHANGED = 'APPLICATION_DISCOUNT_CHANGED', 'Application discount changed'
         LINE_ADDED = 'LINE_ADDED', 'Line added'
         LINE_UPDATED = 'LINE_UPDATED', 'Line updated'
