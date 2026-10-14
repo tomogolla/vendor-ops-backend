@@ -8,17 +8,24 @@ from django.utils import timezone
 from .normalization import normalize_email, normalize_instagram, normalize_phone
 
 
+def vendor_label_expression(prefix=''):
+    """SQL for Vendor.label. `prefix` is the path to the vendor, e.g. 'vendor__' from Application."""
+    vendor_ref = models.OuterRef(f'{prefix}pk' if prefix else 'pk')
+    won = Application.objects.filter(vendor=vendor_ref, stage=Application.Stage.WON)
+    return models.Case(
+        models.When(**{f'{prefix}journey_stage': Vendor.JourneyStage.SUSPENDED},
+                    then=models.Value(Vendor.Label.SUSPENDED)),
+        models.When(**{f'{prefix}is_active': False}, then=models.Value(Vendor.Label.INACTIVE)),
+        models.When(models.Exists(won), then=models.Value(Vendor.Label.ACTIVE)),
+        default=models.Value(Vendor.Label.PROSPECT),
+        output_field=models.CharField(),
+    )
+
+
 class VendorQuerySet(models.QuerySet):
     def with_label(self):
         """Annotates `label_value` (see Vendor.label) so lists can filter and sort on it."""
-        won = Application.objects.filter(vendor=models.OuterRef('pk'), stage=Application.Stage.WON)
-        return self.annotate(label_value=models.Case(
-            models.When(journey_stage=Vendor.JourneyStage.SUSPENDED, then=models.Value(Vendor.Label.SUSPENDED)),
-            models.When(is_active=False, then=models.Value(Vendor.Label.INACTIVE)),
-            models.When(models.Exists(won), then=models.Value(Vendor.Label.ACTIVE)),
-            default=models.Value(Vendor.Label.PROSPECT),
-            output_field=models.CharField(),
-        ))
+        return self.annotate(label_value=vendor_label_expression())
 
 
 class Vendor(models.Model):

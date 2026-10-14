@@ -834,3 +834,89 @@ class VendorLabelTests(PipelineTestCase):
         ids = lambda value: {v['id'] for v in client.get('/api/v1/vendors/', {'label': value}).json()['results']}  # noqa: E731
         self.assertEqual(ids('active'), {str(active.pk)})
         self.assertEqual(ids('inactive,suspended'), {str(inactive.pk), str(suspended.pk)})
+
+
+class SeedDevTests(ApiTestCase):
+    """Runs seed_dev against the test database only."""
+
+    def test_seed_covers_every_stage_and_a_full_variant(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.test import override_settings
+
+        with override_settings(DEBUG=True):
+            call_command('seed_dev', password='seed-Password-1', stdout=StringIO())
+        stages = set(Application.objects.values_list('stage', flat=True))
+        self.assertEqual(stages, set(Stage.values))
+        full = BoothVariant.objects.get(weekend__label='Oct 10 & 11', name='8ft x 8ft')
+        self.assertEqual(full.lines.filter(status=LineStatus.CONFIRMED).count(), 1)
+        self.assertEqual(full.lines.get(status=LineStatus.CONFIRMED).quantity, full.capacity)
+        self.assertTrue(full.lines.filter(status=LineStatus.WAITLISTED).exists())
+        self.assertEqual(Vendor.objects.get(brand_name='Stark Industries').label, 'suspended')
+        self.assertEqual(Vendor.objects.get(brand_name='Acme Corporation').label, 'active')
+
+
+class ApplicationListTests(PipelineTestCase):
+    def ids(self, **params):
+        response = self.as_user(self.member).get('/api/v1/applications/', params)
+        self.assertEqual(response.status_code, 200, response.content)
+        return {item['id'] for item in response.json()['results']}
+
+    def log(self, application, outcome):
+        call = application.tasks.get(task_type=Task.TaskType.DISCOVERY_CALL)
+        self.as_user(self.member).post(f'/api/v1/tasks/{call.pk}/log-call/', {'outcome': outcome}, format='json')
+
+    def test_filters(self):
+        fresh = self.application(**self.vendor_payload(1))
+        no_answer = self.application(**self.vendor_payload(2))
+        self.log(no_answer, 'No Answer')
+        reached = self.application(**self.vendor_payload(3))
+        self.log(reached, 'Interested')
+        waiting = self.at_stage(Stage.IN_REVIEW, **self.vendor_payload(4))
+        self.decide(self.line(waiting, self.other_booth), 'waitlist')
+        Vendor.objects.filter(pk=fresh.vendor_id).update(owner=self.member)
+        Application.objects.filter(pk=reached.pk).update(source='Application form')
+
+        self.assertEqual(self.ids(stage='NEW'), {str(fresh.pk)})
+        self.assertEqual(self.ids(stage='NEW,IN_REVIEW'), {str(a.pk) for a in (fresh, no_answer, reached, waiting)})
+        self.assertEqual(self.ids(has_waitlisted_lines='true'), {str(waiting.pk)})
+        self.assertEqual(self.ids(call='none'), {str(fresh.pk)})
+        self.assertEqual(self.ids(call='attempted_not_reached'), {str(no_answer.pk)})
+        self.assertEqual(self.ids(owner='me'), {str(fresh.pk)})
+        self.assertNotIn(str(fresh.pk), self.ids(owner='none'))
+        self.assertEqual(self.ids(source='application form'), {str(reached.pk)})
+        self.assertEqual(self.ids(weekend=str(self.other_weekend.pk)), {str(waiting.pk)})
+        self.assertEqual(self.ids(weekend=str(self.weekend.pk)), set())
+
+    def test_list_fields(self):
+        application = self.application()
+        self.log(application, 'No Answer')
+        self.decide(self.line(application), 'waitlist')
+        item = next(a for a in self.as_user(self.member).get('/api/v1/applications/').json()['results']
+                    if a['id'] == str(application.pk))
+        self.assertEqual(
+            {k: item[k] for k in ('stage', 'has_waitlisted_lines', 'call_exhausted', 'call_attempts',
+                                  'vendor_brand', 'vendor_label')},
+            {'stage': 'IN_REVIEW', 'has_waitlisted_lines': True, 'call_exhausted': False, 'call_attempts': 1,
+             'vendor_brand': 'Juniper', 'vendor_label': 'prospect'},
+        )
+        self.assertIsNotNone(item['stage_entered_at'])
+        self.assertIsNotNone(item['next_task_due_at'])
+
+    def test_summary(self):
+        self.application(**self.vendor_payload(1))
+        older = self.at_stage(Stage.IN_REVIEW, **self.vendor_payload(2))
+        newer = self.at_stage(Stage.IN_REVIEW, **self.vendor_payload(3))
+        for application in (older, newer):
+            self.decide(self.line(application, self.big_booth), 'confirm')
+            pipeline.mark_billed(application, actor=self.admin)
+        Application.objects.filter(pk=older.pk).update(billed_at=timezone.now() - timedelta(days=9))
+
+        body = self.as_user(self.member).get('/api/v1/applications/summary/').json()
+        self.assertEqual(body['stages'], {'NEW': 1, 'IN_REVIEW': 0, 'AWAITING_PAYMENT': 2, 'WON': 0,
+                                          'DECLINED': 0, 'WITHDRAWN': 0})
+        oldest = body['oldest_awaiting_payment']
+        self.assertEqual([(item['id'], item['days_since_billed']) for item in oldest],
+                         [(str(older.pk), 9), (str(newer.pk), 0)])
+        self.assertEqual(oldest[0]['brand_name'], 'Vendor 2')

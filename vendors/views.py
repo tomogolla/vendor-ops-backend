@@ -1,4 +1,6 @@
-from django.db.models import Exists, OuterRef, Prefetch
+from django.db.models import Count, Exists, F, OuterRef, Prefetch, Subquery, Sum
+from django.db.models.functions import Coalesce
+from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -11,7 +13,7 @@ from tasks.models import Task
 
 from . import pipeline, services
 from .filters import ApplicationFilter, VendorFilter
-from .models import Application, ApplicationLine, Vendor
+from .models import Application, ApplicationLine, Vendor, vendor_label_expression
 from .serializers import (
     VENDOR_EDITABLE_FIELDS,
     ActivityEventSerializer,
@@ -159,15 +161,47 @@ class ApplicationViewSet(
 ):
     serializer_class = ApplicationSerializer
     filterset_class = ApplicationFilter
-    ordering_fields = ['submitted_at', 'updated_at']
+    ordering_fields = ['submitted_at', 'updated_at', 'stage_entered_at', 'billed_at']
     http_method_names = ['get', 'post', 'patch', 'head', 'options']
 
     def get_queryset(self):
+        calls = Task.objects.filter(application=OuterRef('pk'), task_type=Task.TaskType.DISCOVERY_CALL)
+        open_tasks = Task.objects.filter(application=OuterRef('pk'), status__in=Task.OPEN_STATUSES, due_at__isnull=False)
         return Application.objects.select_related('vendor', 'reviewer', 'submitted_by').prefetch_related(
             Prefetch('lines', queryset=LINES_QUERYSET),
         ).annotate(
             call_exhausted=Exists(pipeline.exhausted_calls().filter(application=OuterRef('pk'))),
+            call_attempts=Coalesce(
+                Subquery(calls.values('application').annotate(total=Sum('attempt_count')).values('total')), 0,
+            ),
+            next_task_due_at=Subquery(open_tasks.order_by('due_at').values('due_at')[:1]),
+            has_waitlisted_lines=Exists(ApplicationLine.objects.filter(
+                application=OuterRef('pk'), status=ApplicationLine.Status.WAITLISTED,
+            )),
+            vendor_label=vendor_label_expression('vendor__'),
         )
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """Counts per stage (respecting the list filters) and the oldest applications awaiting payment."""
+        applications = self.filter_queryset(Application.objects.all())
+        counts = dict(applications.values_list('stage').annotate(count=Count('id')).order_by())
+        now = timezone.now()
+        awaiting = (
+            Application.objects.filter(stage=Application.Stage.AWAITING_PAYMENT).select_related('vendor')
+            .order_by(F('billed_at').asc(nulls_first=True), 'submitted_at')[:10]
+        )
+        return Response({
+            'stages': {stage: counts.get(stage, 0) for stage in Application.Stage.values},
+            'oldest_awaiting_payment': [
+                {
+                    'id': str(application.pk), 'brand_name': application.vendor.brand_name,
+                    'billed_at': application.billed_at,
+                    'days_since_billed': (now - application.billed_at).days if application.billed_at else None,
+                }
+                for application in awaiting
+            ],
+        })
 
     def create(self, request, *args, **kwargs):
         """+Add vendor: looks the vendor up (or creates it) and submits. A submission for a vendor

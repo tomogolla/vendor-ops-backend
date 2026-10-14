@@ -191,12 +191,18 @@ class ApplicationSerializer(serializers.ModelSerializer):
     call_exhausted = serializers.SerializerMethodField(
         help_text='The call task closed after the last allowed No Answer; what happens next is undecided.'
     )
+    vendor_brand = serializers.CharField(source='vendor.brand_name', read_only=True)
+    vendor_label = serializers.SerializerMethodField()
+    has_waitlisted_lines = serializers.SerializerMethodField()
+    call_attempts = serializers.SerializerMethodField()
+    next_task_due_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Application
         fields = [
-            'id', 'vendor', 'vendor_detail', 'vendor_data', 'requested_lines', 'notes', 'submitted_by', 'source',
-            'submitted_at', 'stage', 'stage_entered_at', 'call_exhausted', 'status', 'legacy_status',
+            'id', 'vendor', 'vendor_brand', 'vendor_label', 'vendor_detail', 'vendor_data', 'requested_lines', 'notes',
+            'submitted_by', 'source', 'submitted_at', 'stage', 'stage_entered_at',
+            'has_waitlisted_lines', 'call_exhausted', 'call_attempts', 'next_task_due_at', 'status', 'legacy_status',
             'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
             'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
             'lines', 'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
@@ -213,6 +219,29 @@ class ApplicationSerializer(serializers.ModelSerializer):
         if annotated is not None:
             return annotated
         return exhausted_calls().filter(application=application).exists()
+
+    # The fallbacks below run only for an application not loaded through ApplicationViewSet.get_queryset.
+
+    def get_vendor_label(self, application) -> str:
+        return getattr(application, 'vendor_label', None) or application.vendor.label
+
+    def get_has_waitlisted_lines(self, application) -> bool:
+        annotated = getattr(application, 'has_waitlisted_lines', None)
+        if annotated is not None:
+            return annotated
+        return any(line.status == ApplicationLine.Status.WAITLISTED for line in application.lines.all())
+
+    def get_call_attempts(self, application) -> int:
+        annotated = getattr(application, 'call_attempts', None)
+        if annotated is not None:
+            return annotated
+        return sum(application.tasks.filter(task_type=Task.TaskType.DISCOVERY_CALL).values_list('attempt_count', flat=True))
+
+    def get_next_task_due_at(self, application):
+        if hasattr(application, 'next_task_due_at'):
+            return application.next_task_due_at
+        task = application.tasks.filter(status__in=Task.OPEN_STATUSES, due_at__isnull=False).order_by('due_at').first()
+        return task.due_at if task else None
 
     def to_representation(self, application):
         """Adds currency, requested_total_cents, confirmed_subtotal_cents, discount_cents and
