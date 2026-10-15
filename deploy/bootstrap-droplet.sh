@@ -25,6 +25,9 @@ if [[ ! -f /etc/vendor-ops/backend.env ]]; then
 fi
 
 install -m 0644 "${SCRIPT_DIR}/vendor-ops-backend.service" /etc/systemd/system/vendor-ops-backend.service
+# The email worker units are installed here but only enabled by deploy-backend.sh, once a release exists.
+install -m 0644 "${SCRIPT_DIR}/vendor-ops-send-emails.service" /etc/systemd/system/vendor-ops-send-emails.service
+install -m 0644 "${SCRIPT_DIR}/vendor-ops-send-emails.timer" /etc/systemd/system/vendor-ops-send-emails.timer
 if [[ ! -f /etc/nginx/sites-available/ops.thegoodflea.com ]]; then
     install -m 0644 "${SCRIPT_DIR}/nginx-ops.thegoodflea.com.conf" /etc/nginx/sites-available/ops.thegoodflea.com
 fi

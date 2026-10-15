@@ -439,6 +439,12 @@ sudo systemctl reload nginx
 # Verify application and database health
 curl --fail https://ops.thegoodflea.com/api/v1/health/
 
+# Email worker (runs every minute; sends nothing unless EMAIL_GLOBAL_MODE allows it — see README "Email")
+sudo systemctl list-timers vendor-ops-send-emails.timer
+sudo journalctl -u vendor-ops-send-emails.service -n 50 --no-pager
+sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py send_due_emails --dry-run
+sudo systemctl stop vendor-ops-send-emails.timer   # emergency stop; the next deploy starts it again
+
 # List retained releases
 ls -1dt /opt/vendor-ops/releases/backend-*
 ls -1dt /var/www/vendor-ops/releases/frontend-*
