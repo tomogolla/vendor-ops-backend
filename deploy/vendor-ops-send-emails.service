@@ -1,0 +1,22 @@
+[Unit]
+Description=The Good Flea Vendor Ops: send due emails
+Documentation=file:///opt/vendor-ops/backend-current/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+# Run by vendor-ops-send-emails.timer every minute. Same user, environment and virtualenv as the
+# Django service. Whether anything is actually sent is decided by EMAIL_GLOBAL_MODE (default
+# disabled) and the admin email settings, never by this unit.
+Type=oneshot
+User=vendorops
+Group=www-data
+WorkingDirectory=/opt/vendor-ops/backend-current
+EnvironmentFile=/etc/vendor-ops/backend.env
+ExecStart=/opt/vendor-ops/venv/bin/python manage.py send_due_emails --limit 50
+TimeoutStartSec=300
+UMask=0007
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true

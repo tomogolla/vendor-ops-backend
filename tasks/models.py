@@ -10,6 +10,7 @@ class Task(models.Model):
         DISCOVERY_CALL = 'DISCOVERY_CALL', 'Discovery call'
         APPLICATION_REVIEW = 'APPLICATION_REVIEW', 'Application review'
         FOLLOW_UP = 'FOLLOW_UP', 'Follow-up'
+        EMAIL_REVIEW = 'EMAIL_REVIEW', 'Review email'
 
     class Status(models.TextChoices):
         TODO = 'TODO', 'To do'

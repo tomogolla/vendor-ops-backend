@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Vendor Ops send_due_emails every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+# Missed runs are not replayed after downtime; the next run picks up everything that is due.
+Persistent=false
+Unit=vendor-ops-send-emails.service
+
+[Install]
+WantedBy=timers.target

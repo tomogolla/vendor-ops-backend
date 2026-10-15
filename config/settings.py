@@ -17,6 +17,22 @@ env = environ.Env(
     BUSINESS_OPEN=(str, '09:00'),
     BUSINESS_CLOSE=(str, '17:00'),
     DISCOVERY_CALL_DUE_BUSINESS_HOURS=(float, 2.0),
+    # Email (Slice 1 foundation). Safe defaults: the console provider and sending disabled.
+    EMAIL_PROVIDER=(str, 'console'),
+    EMAIL_GLOBAL_MODE=(str, 'disabled'),
+    EMAIL_FROM_NAME=(str, 'The Good Flea'),
+    EMAIL_FROM_ADDRESS=(str, ''),
+    EMAIL_REPLY_TO=(str, ''),
+    EMAIL_REDIRECT_TO=(str, ''),
+    EMAIL_TIMEZONE=(str, 'America/New_York'),
+    EMAIL_SEND_WINDOW_START=(str, '09:00'),
+    EMAIL_SEND_WINDOW_END=(str, '18:00'),
+    EMAIL_SMTP_HOST=(str, 'smtp-relay.gmail.com'),
+    EMAIL_SMTP_PORT=(int, 587),
+    EMAIL_SMTP_USE_TLS=(bool, True),
+    EMAIL_SMTP_USERNAME=(str, ''),
+    EMAIL_SMTP_PASSWORD=(str, ''),
+    EMAIL_SMTP_TIMEOUT=(int, 20),
 )
 environ.Env.read_env(BASE_DIR / '.env')
 
@@ -39,6 +55,7 @@ INSTALLED_APPS = [
     'vendors',
     'tasks',
     'imports',
+    'communications.apps.CommunicationsConfig',
 ]
 
 MIDDLEWARE = [
@@ -139,6 +156,37 @@ DISCOVERY_CALL_DUE_BUSINESS_HOURS = env('DISCOVERY_CALL_DUE_BUSINESS_HOURS')
 MAX_CALL_ATTEMPTS = 5
 # Money is stored as integer cents (`*_cents`); the currency code is for display only.
 CURRENCY = 'USD'
+
+# --- Email (communications app) ------------------------------------------------
+# Django never sends from a web request: messages are queued in the database and the
+# `send_due_emails` command (systemd timer) delivers them. See README "Email".
+# Provider: `console` (Django's EMAIL_BACKEND; console locally, in-memory in tests) or
+# `smtp_relay` (Google Workspace SMTP relay, production only).
+EMAIL_PROVIDER = env('EMAIL_PROVIDER')
+# Ceiling for sending: disabled | redirect | enabled. The admin setting can only be stricter.
+EMAIL_GLOBAL_MODE = env('EMAIL_GLOBAL_MODE')
+EMAIL_FROM_NAME = env('EMAIL_FROM_NAME')
+EMAIL_FROM_ADDRESS = env('EMAIL_FROM_ADDRESS')
+EMAIL_REPLY_TO = env('EMAIL_REPLY_TO')
+EMAIL_REDIRECT_TO = env('EMAIL_REDIRECT_TO')
+EMAIL_TIMEZONE = env('EMAIL_TIMEZONE')
+EMAIL_SEND_WINDOW_START = env('EMAIL_SEND_WINDOW_START')
+EMAIL_SEND_WINDOW_END = env('EMAIL_SEND_WINDOW_END')
+EMAIL_SMTP = {
+    'host': env('EMAIL_SMTP_HOST'),
+    'port': env('EMAIL_SMTP_PORT'),
+    'use_tls': env('EMAIL_SMTP_USE_TLS'),
+    'username': env('EMAIL_SMTP_USERNAME'),
+    'password': env('EMAIL_SMTP_PASSWORD'),
+    'timeout': env('EMAIL_SMTP_TIMEOUT'),
+}
+# Conservative delivery rules for the worker.
+EMAIL_MAX_ATTEMPTS = 3
+EMAIL_RETRY_DELAYS_MINUTES = [5, 30]
+EMAIL_QUEUE_MAX_AGE_HOURS = 72
+EMAIL_STUCK_SENDING_MINUTES = 15
+# Used by the `console` provider. Never an SMTP backend: production delivery goes through the provider.
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
 LOGGING = {
     'version': 1,

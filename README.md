@@ -15,7 +15,7 @@ python manage.py runserver 8000
 python manage.py test
 ```
 
-Apps: `accounts` (users and roles), `catalog` (market weekends, booth variants, add-ons),
+Apps: `accounts` (users and roles), `communications` (email; see "Email" below), `catalog` (market weekends, booth variants, add-ons),
 `vendors` (vendors, applications and their lines, intake events, notes, activity timeline),
 `tasks` (tasks, business-hours scheduling, call logging), `imports` (CSV).
 Business rules live in services (`vendors/services.py`, `vendors/pipeline.py`,
@@ -142,3 +142,141 @@ Migrations in this change are expand-only, so these remain and are kept working:
 - PATCH `/applications/{id}/` with `status` maps IN_REVIEW, DECLINED and WITHDRAWN onto stages and
   answers 400 for APPROVED and WAITLISTED.
 - `APPLICATION_STATUS_CHANGED` events remain in history; new changes record `APPLICATION_STAGE_CHANGED`.
+
+## Email (v1.3.1, Slice 1: foundation)
+
+The `communications` app gives Vendor Ops a safe, auditable email foundation. In this slice **nothing
+triggers email yet** (no application, call, invoice or market workflow queues messages), every seeded
+template is **Off**, and the default configuration sends nothing.
+
+### How it works
+
+```
+workflow service ──(transaction.on_commit)──▶ queue_email() ──▶ EmailMessage (snapshot)
+                                                                   │  queued / draft / skipped
+systemd timer (every minute) ──▶ manage.py send_due_emails ──▶ provider ──▶ Google SMTP relay
+```
+
+- **Django owns everything**: templates, queued messages, delivery history and send decisions.
+  Email is never sent inside a web request: services call
+  `communications.services.queue_email_on_commit(template_key, vendor=..., application=...,
+  market_weekend=..., event_key=..., actor=...)`, which runs only after the transaction commits.
+- **Templates** (`EmailTemplate`) have a mode: **Off** (nothing is created), **Draft** (a draft
+  message plus one *Review email* task for the application's reviewer or the vendor's owner) or
+  **Auto** (queued for the next send window). The only syntax is `{variable}` from a fixed whitelist
+  (`vendor_name`, `application_reference`, `market_name`, `market_dates`, `owner_name`,
+  `payment_link`); `{{` and `}}` are literal braces. Database content is never run through Django's
+  template engine, and unknown or undeclared placeholders are rejected when a template is saved.
+  Values are HTML-escaped in HTML bodies.
+- **Messages** (`EmailMessage`) snapshot the rendered subject, bodies, recipient, sender and
+  reply-to when they are queued; editing a template never changes history, and the content fields
+  cannot be changed or deleted. One message per template + application (or vendor) + `event_key`,
+  enforced by a unique `dedupe_key`.
+- **Recipients**: the vendor's contact email (never a payer). Missing, invalid or suppressed
+  addresses produce a `skipped` message with a reason. `EmailRecipientPreference` holds suppression
+  (unsubscribe, hard bounce, complaint, invalid address, manual), marketing consent (required for
+  promotional templates) and whether transactional email is permitted; it is ready for the public
+  unsubscribe page in a later slice.
+- **Activity**: queued, drafted, sent, failed, skipped and cancelled outcomes are written to the
+  vendor timeline (`EMAIL_*` events; no bodies or addresses in the metadata).
+- **Stop conditions** (`communications/stop_conditions.py`): checks re-run just before sending, e.g.
+  a later "application is still unpaid" check for payment reminders. Slice 1 registers none.
+
+### Sending modes and settings
+
+The effective sending mode is the **stricter** of `EMAIL_GLOBAL_MODE` (environment) and the admin
+*Email settings* (Django admin → Email communications → Email settings; administrators only):
+
+| Mode | What the worker does |
+| --- | --- |
+| `disabled` | Sends nothing; due messages wait (and expire after 72 hours). |
+| `redirect` | Sends every message to the redirect mailbox (`EMAIL_REDIRECT_TO` or the admin setting) with the original recipient in the subject and body. Vendors receive nothing. |
+| `enabled` | Sends to vendors. |
+
+`EMAIL_FROM_ADDRESS`, `EMAIL_REPLY_TO` and `EMAIL_REDIRECT_TO` win over the admin values when set.
+The send window (`EMAIL_SEND_WINDOW_START`/`END`, admin-editable) is applied in the configured
+business time zone (`EMAIL_TIMEZONE`), never the server's.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `EMAIL_PROVIDER` | `console` | `console` uses Django's console backend (in-memory under tests); `smtp_relay` is the Google Workspace SMTP relay. |
+| `EMAIL_GLOBAL_MODE` | `disabled` | `disabled`, `redirect` or `enabled`; a ceiling for the admin setting. |
+| `EMAIL_FROM_NAME`, `EMAIL_FROM_ADDRESS`, `EMAIL_REPLY_TO` | `The Good Flea`, empty, empty | The from address is required for `smtp_relay` (system check). |
+| `EMAIL_REDIRECT_TO` | empty | Team mailbox for redirect mode. |
+| `EMAIL_TIMEZONE` | `America/New_York` | |
+| `EMAIL_SEND_WINDOW_START`, `EMAIL_SEND_WINDOW_END` | `09:00`, `18:00` | Same-day window. |
+| `EMAIL_SMTP_HOST`, `EMAIL_SMTP_PORT`, `EMAIL_SMTP_USE_TLS` | `smtp-relay.gmail.com`, `587`, `true` | STARTTLS. |
+| `EMAIL_SMTP_USERNAME`, `EMAIL_SMTP_PASSWORD` | empty | Optional: leave empty when the relay trusts the droplet's IP. Never commit them. |
+
+### The worker: `send_due_emails`
+
+```sh
+python manage.py send_due_emails --dry-run      # what would happen; changes and sends nothing
+python manage.py send_due_emails --limit 50     # what the timer runs (limit 1-500)
+```
+
+Each run prints one line: `scanned`, `sent`, `drafted` (drafts awaiting review), `skipped`, `failed`
+and `deferred`. Due messages are claimed with `SELECT … FOR UPDATE SKIP LOCKED` and marked `sending`
+before the provider is called, so concurrent runs never send the same message. Just before sending,
+the worker re-checks expiry, the sender, the recipient, suppression and stop conditions. Retries are
+conservative: transient failures (connection problems, 4xx replies) are retried after 5 and 30
+minutes, three attempts in all, then marked `failed`; permanent failures (5xx, refused recipient,
+authentication) fail at once; a message stuck in `sending` for 15 minutes is marked `failed` and is
+never re-sent automatically, because it may already have been delivered.
+
+Drafts are reviewed in Django admin (Email messages): administrators use the **Approve** and
+**Cancel** actions; message records are otherwise read-only.
+
+### Local, safe testing
+
+The defaults (`EMAIL_PROVIDER=console`, `EMAIL_GLOBAL_MODE=disabled`) never reach a mail server. To
+watch messages locally, set `EMAIL_GLOBAL_MODE=redirect` and `EMAIL_REDIRECT_TO=you@example.com`,
+move one template to Auto in the admin, trigger it from a shell with `queue_email(...)`, and run
+`send_due_emails`: the message is printed to the console. Tests use Django's in-memory backend and a
+fake SMTP server; they never contact a real one.
+
+### Production: systemd timer
+
+`deploy/deploy-backend.sh` installs or updates `vendor-ops-send-emails.service` and
+`vendor-ops-send-emails.timer` on every deploy, pauses the timer during migrations and enables it
+afterwards. The units use the same user, virtualenv and `/etc/vendor-ops/backend.env` as the API.
+With the default environment the timer runs but sends nothing.
+
+```sh
+sudo systemctl enable --now vendor-ops-send-emails.timer     # done by the deploy script
+sudo systemctl list-timers vendor-ops-send-emails.timer      # next and last run
+sudo systemctl status vendor-ops-send-emails.service --no-pager
+sudo journalctl -u vendor-ops-send-emails.service -n 50 --no-pager
+sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py send_due_emails --dry-run
+sudo systemctl stop vendor-ops-send-emails.timer             # emergency stop (or set EMAIL_GLOBAL_MODE=disabled)
+```
+
+### Google Workspace SMTP relay: prerequisites (outside the application)
+
+Production email cannot be delivered until all of these are done and verified; the application
+does not change any of them.
+
+1. **Workspace admin** (Apps → Google Workspace → Gmail → Routing → SMTP relay service): add a relay
+   rule that allows the DigitalOcean droplet's static IP address, requires TLS, and allows only
+   addresses in your domains. Decide whether the relay also requires SMTP authentication; if it does,
+   set `EMAIL_SMTP_USERNAME`/`EMAIL_SMTP_PASSWORD` for a Workspace account in
+   `/etc/vendor-ops/backend.env`.
+2. **DNS for thegoodflea.com** (managed in Shopify, so these are Shopify DNS changes):
+   - SPF: the TXT record must include Google, e.g. `v=spf1 include:_spf.google.com ~all` (merge with
+     any existing SPF; there can only be one SPF record).
+   - DKIM: generate the key in the Workspace admin (Gmail → Authenticate email) and publish the
+     `google._domainkey` TXT record, then start authentication.
+   - DMARC: publish `_dmarc.thegoodflea.com` starting at `p=none` with a reporting address, e.g.
+     `v=DMARC1; p=none; rua=mailto:dmarc-reports@thegoodflea.com`; tighten later.
+3. Set `EMAIL_PROVIDER=smtp_relay`, `EMAIL_FROM_ADDRESS` (an address in the domain),
+   `EMAIL_REPLY_TO` and `EMAIL_REDIRECT_TO` in the server environment, then restart the API.
+
+### Staged rollout
+
+1. Deploy with `EMAIL_GLOBAL_MODE=redirect` and `EMAIL_REDIRECT_TO` set to a team mailbox (admin
+   setting `redirect` too). Templates are still Off.
+2. Turn one template to Auto or Draft only to exercise it, and inspect the redirected messages in
+   the team mailbox (headers, SPF/DKIM pass, layout, copy).
+3. Set templates to **Draft** and let real drafts accumulate once triggers exist (Slice 2).
+4. Review real drafts in the admin; approve or cancel.
+5. Raise the ceiling to `enabled`, then move selected templates to **Auto** one at a time.
