@@ -411,6 +411,12 @@ class ActivityEvent(models.Model):
         LINE_CANCELLED = 'LINE_CANCELLED', 'Line cancelled'
         LINE_RELEASED = 'LINE_RELEASED', 'Line hold released'
         VENDOR_STATUS_CHANGED = 'VENDOR_STATUS_CHANGED', 'Vendor status changed'
+        EMAIL_QUEUED = 'EMAIL_QUEUED', 'Email queued'
+        EMAIL_DRAFTED = 'EMAIL_DRAFTED', 'Email drafted for review'
+        EMAIL_SENT = 'EMAIL_SENT', 'Email sent'
+        EMAIL_FAILED = 'EMAIL_FAILED', 'Email failed'
+        EMAIL_SKIPPED = 'EMAIL_SKIPPED', 'Email skipped'
+        EMAIL_CANCELLED = 'EMAIL_CANCELLED', 'Email cancelled'
         NOTE_ADDED = 'NOTE_ADDED', 'Note added'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
