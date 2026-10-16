@@ -185,10 +185,12 @@ class EmailMessage(models.Model):
         Status.SENT, Status.FAILED, Status.SKIPPED, Status.CANCELLED, Status.DELIVERED, Status.BOUNCED, Status.COMPLAINED,
     )
     SNAPSHOT_FIELDS = (
-        'template_id', 'template_key', 'vendor_id', 'application_id', 'market_weekend_id', 'recipient_name', 'recipient_email',
-        'sender_name', 'sender_email', 'reply_to_email', 'subject', 'html_body', 'text_body', 'dedupe_key',
-        'event_key', 'created_by_id',
+        'template_id', 'template_key', 'vendor_id', 'application_id', 'market_weekend_id', 'application_line_id',
+        'recipient_name', 'recipient_email', 'sender_name', 'sender_email', 'reply_to_email', 'subject', 'html_body',
+        'text_body', 'dedupe_key', 'event_key', 'trigger', 'created_by_id',
     )
+    # Draft content can be revised through services.revise_draft (each version is kept).
+    REVISABLE_FIELDS = ('subject', 'html_body', 'text_body')
 
     template = models.ForeignKey(EmailTemplate, null=True, blank=True, on_delete=models.PROTECT, related_name='messages')
     template_key = models.CharField(max_length=64, blank=True, help_text='Snapshot of the template key.')
@@ -199,6 +201,15 @@ class EmailMessage(models.Model):
     market_weekend = models.ForeignKey(
         'catalog.MarketWeekend', null=True, blank=True, on_delete=models.PROTECT, related_name='email_messages'
     )
+    application_line = models.ForeignKey(
+        'vendors.ApplicationLine', null=True, blank=True, on_delete=models.PROTECT, related_name='email_messages',
+        help_text='The booth line a line decision (e.g. a waitlist update) is about.',
+    )
+    trigger = models.JSONField(
+        default=dict, blank=True,
+        help_text='Snapshot of the triggering event (e.g. call task and attempt, decision time), used by stop conditions.',
+    )
+    revision = models.PositiveSmallIntegerField(default=0, db_default=0, help_text='Number of edits made to the draft.')
     review_task = models.ForeignKey(
         'tasks.Task', null=True, blank=True, on_delete=models.SET_NULL, related_name='email_messages',
         help_text='The Review email task for a draft.',
@@ -252,15 +263,53 @@ class EmailMessage(models.Model):
 
     def save(self, *args, **kwargs):
         if not self._state.adding and self.pk:
-            stored = type(self).objects.filter(pk=self.pk).values(*self.SNAPSHOT_FIELDS).first()
+            stored = type(self).objects.filter(pk=self.pk).values('status', *self.SNAPSHOT_FIELDS).first()
             if stored:
                 changed = [name for name in self.SNAPSHOT_FIELDS if stored[name] != getattr(self, name)]
+                # The one exception: services.revise_draft may change a draft's content, after keeping
+                # the previous version as an EmailDraftRevision.
+                revising = getattr(self, '_revising', False) and stored['status'] == self.Status.DRAFT
+                if revising:
+                    changed = [name for name in changed if name not in self.REVISABLE_FIELDS]
                 if changed:
                     raise ValidationError(f'Email messages are immutable; cannot change {", ".join(changed)}.')
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         raise ValidationError('Email messages are kept as history and cannot be deleted.')
+
+
+class EmailDraftRevision(models.Model):
+    """A previous version of a draft's content, kept when someone edits the draft. Append-only:
+    revision N holds the content the message had before its Nth edit (revision 1 is the original
+    rendering); the message itself always holds the latest version."""
+
+    message = models.ForeignKey(EmailMessage, on_delete=models.PROTECT, related_name='revisions')
+    number = models.PositiveSmallIntegerField()
+    subject = models.CharField(max_length=255)
+    html_body = models.TextField()
+    text_body = models.TextField()
+    replaced_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
+        help_text='Who made the edit that replaced this version.',
+    )
+    note = models.CharField(max_length=300, blank=True, help_text='Why the draft was edited (optional).')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['message', 'number']
+        constraints = [models.UniqueConstraint(fields=['message', 'number'], name='one_revision_number_per_message')]
+
+    def __str__(self):
+        return f'Revision {self.number} of {self.message}'
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError('Draft revisions are history and cannot be changed.')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError('Draft revisions are history and cannot be deleted.')
 
 
 class EmailRecipientPreference(models.Model):
