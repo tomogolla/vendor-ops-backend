@@ -154,7 +154,8 @@ template is **Off**, and the default configuration sends nothing.
 ```
 workflow service ──(transaction.on_commit)──▶ queue_email() ──▶ EmailMessage (snapshot)
                                                                    │  queued / draft / skipped
-systemd timer (every minute) ──▶ manage.py send_due_emails ──▶ provider ──▶ Google SMTP relay
+systemd timer (every minute) ──▶ manage.py send_due_emails ──▶ provider ──▶ Resend API or Google SMTP relay
+Resend ──(signed webhook)──▶ /api/v1/webhooks/anymail/resend/tracking/ ──▶ delivered / bounced / complained
 ```
 
 - **Django owns everything**: templates, queued messages, delivery history and send decisions.
@@ -177,8 +178,11 @@ systemd timer (every minute) ──▶ manage.py send_due_emails ──▶ provi
   (unsubscribe, hard bounce, complaint, invalid address, manual), marketing consent (required for
   promotional templates) and whether transactional email is permitted; it is ready for the public
   unsubscribe page in a later slice.
-- **Activity**: queued, drafted, sent, failed, skipped and cancelled outcomes are written to the
-  vendor timeline (`EMAIL_*` events; no bodies or addresses in the metadata).
+- **Activity**: queued, drafted, sent, failed, skipped, cancelled, bounced and complained outcomes are
+  written to the vendor timeline (`EMAIL_*` events; no bodies or addresses in the metadata).
+- **Delivery tracking** (Resend only): the signed webhook moves a sent message to `delivered`,
+  `bounced` or `complained`. Hard bounces and complaints suppress the address in
+  `EmailRecipientPreference` (never for redirected messages, whose bounce concerns the team mailbox).
 - **Stop conditions** (`communications/stop_conditions.py`): checks re-run just before sending, e.g.
   a later "application is still unpaid" check for payment reminders. Slice 1 registers none.
 
@@ -199,14 +203,17 @@ business time zone (`EMAIL_TIMEZONE`), never the server's.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `EMAIL_PROVIDER` | `console` | `console` uses Django's console backend (in-memory under tests); `smtp_relay` is the Google Workspace SMTP relay. |
+| `EMAIL_PROVIDER` | `console` | `console` uses Django's console backend (in-memory under tests); `smtp_relay` is the Google Workspace SMTP relay; `resend` is Resend's API through django-anymail. |
 | `EMAIL_GLOBAL_MODE` | `disabled` | `disabled`, `redirect` or `enabled`; a ceiling for the admin setting. |
-| `EMAIL_FROM_NAME`, `EMAIL_FROM_ADDRESS`, `EMAIL_REPLY_TO` | `The Good Flea`, empty, empty | The from address is required for `smtp_relay` (system check). |
+| `EMAIL_FROM_NAME`, `EMAIL_FROM_ADDRESS`, `EMAIL_REPLY_TO` | `The Good Flea`, empty, empty | The from address is required for `smtp_relay` and `resend` (system check). |
 | `EMAIL_REDIRECT_TO` | empty | Team mailbox for redirect mode. |
 | `EMAIL_TIMEZONE` | `America/New_York` | |
 | `EMAIL_SEND_WINDOW_START`, `EMAIL_SEND_WINDOW_END` | `09:00`, `18:00` | Same-day window. |
 | `EMAIL_SMTP_HOST`, `EMAIL_SMTP_PORT`, `EMAIL_SMTP_USE_TLS` | `smtp-relay.gmail.com`, `587`, `true` | STARTTLS. |
 | `EMAIL_SMTP_USERNAME`, `EMAIL_SMTP_PASSWORD` | empty | Optional: leave empty when the relay trusts the droplet's IP. Never commit them. |
+| `EMAIL_RESEND_API_KEY` | empty | Required for `resend` (system check). Server environment only; never commit it. |
+| `EMAIL_RESEND_WEBHOOK_SECRET` | empty | Resend webhook signing secret (`whsec_…`). Without it the webhook refuses every call (system check warning). Never commit it. |
+| `EMAIL_DAILY_LIMIT` | `90` | Messages sent per day, counted since local midnight in `EMAIL_TIMEZONE`; `0` = no limit. |
 
 ### The worker: `send_due_emails`
 
@@ -224,6 +231,18 @@ minutes, three attempts in all, then marked `failed`; permanent failures (5xx, r
 authentication) fail at once; a message stuck in `sending` for 15 minutes is marked `failed` and is
 never re-sent automatically, because it may already have been delivered.
 
+**Daily limit**: `EMAIL_DAILY_LIMIT` (default 90; `0` = no limit) caps messages sent since local
+midnight in the business time zone (redirected and test messages count too). Once it is reached the
+remaining messages stay queued, untouched (no attempt used, not failed), and the summary says
+`daily limit of 90 reached …; N left queued`. **Rate limits**: an HTTP 429 from Resend puts that
+message and the rest of the batch back in the queue for a minute without using up a retry attempt.
+
+**Test email**: `python manage.py send_test_email you@example.com` sends one message through the same
+path (configured provider, sending mode, redirect mailbox, daily limit; not the send window, no
+retries) and prints the result. In disabled mode nothing is sent; in redirect mode it goes to the
+redirect mailbox. It exits non-zero when nothing was sent, and the message is recorded with template
+key `test_email`.
+
 Drafts are reviewed in Django admin (Email messages): administrators use the **Approve** and
 **Cancel** actions; message records are otherwise read-only.
 
@@ -232,8 +251,8 @@ Drafts are reviewed in Django admin (Email messages): administrators use the **A
 The defaults (`EMAIL_PROVIDER=console`, `EMAIL_GLOBAL_MODE=disabled`) never reach a mail server. To
 watch messages locally, set `EMAIL_GLOBAL_MODE=redirect` and `EMAIL_REDIRECT_TO=you@example.com`,
 move one template to Auto in the admin, trigger it from a shell with `queue_email(...)`, and run
-`send_due_emails`: the message is printed to the console. Tests use Django's in-memory backend and a
-fake SMTP server; they never contact a real one.
+`send_due_emails`: the message is printed to the console. Tests use Django's in-memory backend, a
+fake SMTP server and Anymail's test backend; they never contact a real mail server or Resend.
 
 ### Production: systemd timer
 
@@ -248,8 +267,28 @@ sudo systemctl list-timers vendor-ops-send-emails.timer      # next and last run
 sudo systemctl status vendor-ops-send-emails.service --no-pager
 sudo journalctl -u vendor-ops-send-emails.service -n 50 --no-pager
 sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py send_due_emails --dry-run
+sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py send_test_email you@thegoodflea.com
 sudo systemctl stop vendor-ops-send-emails.timer             # emergency stop (or set EMAIL_GLOBAL_MODE=disabled)
 ```
+
+### Resend: setup (outside the application)
+
+1. **Domain**: in the Resend dashboard (Domains), add `thegoodflea.com` (or a sending subdomain) and
+   publish the DNS records Resend shows (SPF/MX on its bounce subdomain and the DKIM TXT record) in
+   Shopify DNS; wait until Resend marks the domain verified. Publish DMARC at `p=none` as below.
+2. **API key**: create a key with sending access and put it in `/etc/vendor-ops/backend.env` as
+   `EMAIL_RESEND_API_KEY`; set `EMAIL_PROVIDER=resend` and `EMAIL_FROM_ADDRESS` (an address on the
+   verified domain). `manage.py check` refuses `resend` without the key or the from address.
+3. **Webhook**: in Resend (Webhooks), add the endpoint
+   `https://ops.thegoodflea.com/api/v1/webhooks/anymail/resend/tracking/` with the events
+   `email.delivered`, `email.bounced` and `email.complained` (others are accepted and ignored), and
+   copy its signing secret (`whsec_…`) to `EMAIL_RESEND_WEBHOOK_SECRET`. nginx already proxies
+   `/api/`. Calls with a bad or missing signature are answered 400; without a configured secret every
+   call is refused.
+4. Restart the API (`sudo systemctl restart vendor-ops-backend`), then run `send_test_email` in
+   redirect mode before anything else.
+
+The `smtp_relay` provider stays available; switch with `EMAIL_PROVIDER`.
 
 ### Google Workspace SMTP relay: prerequisites (outside the application)
 

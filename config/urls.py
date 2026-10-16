@@ -25,6 +25,8 @@ api_v1 = [
     path('team/', TeamView.as_view(), name='team'),
     path('imports/vendors/preview/', ImportPreviewView.as_view(), name='import-preview'),
     path('imports/vendors/confirm/', ImportConfirmView.as_view(), name='import-confirm'),
+    # Email delivery tracking (Resend via django-anymail); signed calls only.
+    path('webhooks/anymail/', include('communications.urls')),
     path('', include(router.urls)),
 ]
 

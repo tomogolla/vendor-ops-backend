@@ -417,6 +417,8 @@ class ActivityEvent(models.Model):
         EMAIL_FAILED = 'EMAIL_FAILED', 'Email failed'
         EMAIL_SKIPPED = 'EMAIL_SKIPPED', 'Email skipped'
         EMAIL_CANCELLED = 'EMAIL_CANCELLED', 'Email cancelled'
+        EMAIL_BOUNCED = 'EMAIL_BOUNCED', 'Email bounced'
+        EMAIL_COMPLAINED = 'EMAIL_COMPLAINED', 'Email marked as spam'
         NOTE_ADDED = 'NOTE_ADDED', 'Note added'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
