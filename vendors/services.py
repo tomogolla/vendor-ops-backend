@@ -8,6 +8,7 @@ from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from accounts.permissions import is_admin
+from communications import application_emails
 from tasks.models import Task
 from tasks.services import already_reached, ensure_application_review, ensure_discovery_call
 
@@ -215,6 +216,8 @@ def submit_application(
     if notes:
         add_note(vendor, actor=actor, body=notes, note_type=InternalNote.NoteType.APPLICATION_REVIEW,
                  application=application)
+    # Acknowledge genuinely new applications only (a bundled submission returned above).
+    application_emails.application_submitted(application, actor)
     application.bundled, application.call_created = False, call_created
     return application
 

@@ -138,4 +138,7 @@ def log_call(
         from vendors.pipeline import advance_after_call_attempt  # vendors.pipeline imports this module
 
         advance_after_call_attempt(task.application, actor)
+    from communications.application_emails import call_logged  # communications imports tasks
+
+    call_logged(task, actor)
     return task
