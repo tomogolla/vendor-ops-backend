@@ -125,6 +125,11 @@ class DailyLimitTests(ResendTestCase):
         with override_settings(EMAIL_DAILY_LIMIT=3):
             summary = self.run_worker()
             self.assertEqual((summary.sent, summary.deferred, summary.failed, summary.skipped), (3, 1, 0, 0))
+            self.assertEqual(
+                EmailMessage.objects.filter(status=Status.SENT, sent_at=NOON_NY).count(),
+                3,
+                'sent messages use the worker clock used by the daily-limit calculation',
+            )
             self.assertIn('daily limit of 3 reached', summary.note)
             self.assertIn('1 left queued', summary.note)
             again = self.run_worker()

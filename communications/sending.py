@@ -21,7 +21,7 @@ limit). Once it is reached, the remaining messages simply stay queued for the ne
 import html
 import logging
 from dataclasses import asdict, dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone as datetime_timezone
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
@@ -171,7 +171,10 @@ def deliver(message: EmailMessage, provider: EmailProvider, config: EmailSetting
         return _record_failure(message, 'provider_error', f'Unexpected {type(error).__name__}.', transient=allow_retry,
                                summary=summary, now=now)
     message.status = Status.SENT
-    message.sent_at = timezone.now()
+    # Use the worker's clock consistently. Besides making worker runs deterministic,
+    # this keeps the sent timestamp on the same local business day used by the
+    # daily-limit calculation.
+    message.sent_at = now
     message.provider = result.provider
     message.provider_message_id = result.message_id[:255]
     message.delivered_to_email = email.to_email
@@ -200,8 +203,14 @@ def release(message: EmailMessage, now, code: str = 'rate_limited', detail: str 
 
 
 def local_midnight(now, config: EmailSettings) -> datetime:
-    local = now.astimezone(ZoneInfo(config.business_timezone))
-    return datetime.combine(local.date(), time(0), tzinfo=local.tzinfo)
+    if timezone.is_naive(now):
+        raise ValueError('Daily-limit calculations require a timezone-aware datetime.')
+    business_timezone = ZoneInfo(config.business_timezone)
+    local = now.astimezone(business_timezone)
+    local_start = datetime.combine(local.date(), time.min, tzinfo=business_timezone)
+    # Django stores DateTimeField values in UTC. Supplying the cutoff in UTC makes
+    # that conversion explicit and avoids mixing local and UTC boundaries.
+    return local_start.astimezone(datetime_timezone.utc)
 
 
 def daily_remaining(now, config: EmailSettings) -> int | None:
