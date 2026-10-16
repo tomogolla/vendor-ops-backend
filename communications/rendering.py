@@ -15,6 +15,7 @@ VARIABLES: dict[str, str] = {
     'application_reference': 'Short reference for the application, e.g. APP-1A2B3C4D.',
     'market_name': 'The market weekend label, e.g. "Oct 10 & 11".',
     'market_dates': 'The market weekend dates, e.g. "Oct 10 – 11, 2026".',
+    'booth_name': 'The booth (or add-on) a decision is about, e.g. "8ft x 8ft".',
     'owner_name': 'The team member who looks after the vendor, or "The Good Flea team".',
     'payment_link': 'A payment link (https). Only available once invoicing exists.',
 }

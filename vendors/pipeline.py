@@ -11,6 +11,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from accounts.permissions import is_admin
 from catalog.models import AddOn, BoothVariant, MarketWeekend
 from catalog.services import confirmed_quantity
+from communications import application_emails
 from tasks.models import Task
 from tasks.services import ensure_application_review
 
@@ -106,6 +107,9 @@ def move_stage(application: Application, to: str, *, actor, reason='', system=Fa
         **{'from': current, 'to': to, 'reason': reason, 'system': system,
            'cancelled_task_ids': cancelled_tasks, **metadata},
     )
+    if to == Stage.DECLINED:
+        # The internal reason is never passed to the email.
+        application_emails.application_declined(application, actor)
     return application
 
 
@@ -374,6 +378,7 @@ def waitlist_line(line: ApplicationLine, *, actor, reason='') -> ApplicationLine
     line.status_reason = reason
     line.save(update_fields=['status', 'waitlisted_at', 'status_reason', 'updated_at'])
     _line_event(line, Event.LINE_WAITLISTED, 'waitlisted', actor, reason=reason)
+    application_emails.line_waitlisted(line, actor)
     return line
 
 

@@ -292,6 +292,29 @@ class ApplicationViewSet(
             return Response(ApplicationLineSerializer(LINES_QUERYSET.get(pk=line.pk)).data, status=status.HTTP_201_CREATED)
         return Response(ApplicationLineSerializer(LINES_QUERYSET.filter(application=application), many=True).data)
 
+    @action(detail=True, methods=['get', 'post'])
+    def emails(self, request, pk=None):
+        """The application's email history (paginated, newest first). POST prepares a draft by hand:
+        {template_key, application_line?, market_weekend?}."""
+        from communications.serializers import EmailMessageDetailSerializer, EmailMessageSerializer, PrepareDraftSerializer
+        from communications.services import prepare_draft
+        from communications.views import MESSAGES
+
+        application = self.get_object()
+        context = self.get_serializer_context()
+        if request.method == 'POST':
+            serializer = PrepareDraftSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+            message = prepare_draft(
+                data['template_key'], application=application, actor=request.user,
+                application_line=data.get('application_line'), market_weekend=data.get('market_weekend'),
+            )
+            return Response(EmailMessageDetailSerializer(MESSAGES.get(pk=message.pk), context=context).data,
+                            status=status.HTTP_201_CREATED)
+        page = self.paginate_queryset(MESSAGES.filter(application=application).order_by('-created_at'))
+        return self.get_paginated_response(EmailMessageSerializer(page, many=True, context=context).data)
+
     @action(detail=True, methods=['post'], permission_classes=[IsAdministrator], url_path='mark-billed')
     def mark_billed(self, request, pk=None):
         """TODO(invoicing): placeholder until invoicing lands."""

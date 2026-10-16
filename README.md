@@ -117,6 +117,7 @@ stage is SUSPENDED, `inactive` if not active, `active` if any application is WON
 | `applications/summary/` | all | counts per stage and the 10 oldest AWAITING_PAYMENT |
 | `applications/{id}/stage/` (POST) | admins | `{stage, reason}` |
 | `applications/{id}/lines/` (GET, POST) | all | |
+| `applications/{id}/emails/` (GET, POST) | all | the application's emails; POST `{template_key, application_line?}` prepares a draft (see *Application emails*) |
 | `applications/{id}/mark-billed/`, `mark-first-payment/` (POST) | admins | placeholders |
 | `application-lines/{id}/` (GET, PATCH, DELETE) | all | PATCH (quantity) and DELETE only while REQUESTED |
 | `application-lines/{id}/confirm/`, `waitlist/`, `decline/`, `release/` (POST) | admins | `release` needs `reason` |
@@ -145,9 +146,9 @@ Migrations in this change are expand-only, so these remain and are kept working:
 
 ## Email (v1.3.1, Slice 1: foundation)
 
-The `communications` app gives Vendor Ops a safe, auditable email foundation. In this slice **nothing
-triggers email yet** (no application, call, invoice or market workflow queues messages), every seeded
-template is **Off**, and the default configuration sends nothing.
+The `communications` app gives Vendor Ops a safe, auditable email foundation. Every seeded template
+is **Off** and the default configuration sends nothing. Slice 2 (below, *Application emails*) adds
+the first four workflow triggers; with their templates Off they still create nothing.
 
 ### How it works
 
@@ -165,8 +166,8 @@ Resend ──(signed webhook)──▶ /api/v1/webhooks/anymail/resend/tracking/
 - **Templates** (`EmailTemplate`) have a mode: **Off** (nothing is created), **Draft** (a draft
   message plus one *Review email* task for the application's reviewer or the vendor's owner) or
   **Auto** (queued for the next send window). The only syntax is `{variable}` from a fixed whitelist
-  (`vendor_name`, `application_reference`, `market_name`, `market_dates`, `owner_name`,
-  `payment_link`); `{{` and `}}` are literal braces. Database content is never run through Django's
+  (`vendor_name`, `application_reference`, `market_name`, `market_dates`, `booth_name`,
+  `owner_name`, `payment_link`); `{{` and `}}` are literal braces. Database content is never run through Django's
   template engine, and unknown or undeclared placeholders are rejected when a template is saved.
   Values are HTML-escaped in HTML bodies.
 - **Messages** (`EmailMessage`) snapshot the rendered subject, bodies, recipient, sender and
@@ -183,8 +184,9 @@ Resend ──(signed webhook)──▶ /api/v1/webhooks/anymail/resend/tracking/
 - **Delivery tracking** (Resend only): the signed webhook moves a sent message to `delivered`,
   `bounced` or `complained`. Hard bounces and complaints suppress the address in
   `EmailRecipientPreference` (never for redirected messages, whose bounce concerns the team mailbox).
-- **Stop conditions** (`communications/stop_conditions.py`): checks re-run just before sending, e.g.
-  a later "application is still unpaid" check for payment reminders. Slice 1 registers none.
+- **Stop conditions** (`communications/stop_conditions.py`): per-template checks that say an email no
+  longer applies. They run when a message is prepared, when a draft is approved and again just
+  before sending. Slice 2 registers the four application checks (see *Application emails*).
 
 ### Sending modes and settings
 
@@ -222,8 +224,8 @@ python manage.py send_due_emails --dry-run      # what would happen; changes and
 python manage.py send_due_emails --limit 50     # what the timer runs (limit 1-500)
 ```
 
-Each run prints one line: `scanned`, `sent`, `drafted` (drafts awaiting review), `skipped`, `failed`
-and `deferred`. Due messages are claimed with `SELECT … FOR UPDATE SKIP LOCKED` and marked `sending`
+Each run prints one line: `scanned`, `sent`, `drafted` (drafts awaiting review), `skipped`, `failed`,
+`deferred` and `stale_cancelled` (drafts cancelled because they no longer apply). Due messages are claimed with `SELECT … FOR UPDATE SKIP LOCKED` and marked `sending`
 before the provider is called, so concurrent runs never send the same message. Just before sending,
 the worker re-checks expiry, the sender, the recipient, suppression and stop conditions. Retries are
 conservative: transient failures (connection problems, 4xx replies) are retried after 5 and 30
@@ -243,8 +245,9 @@ retries) and prints the result. In disabled mode nothing is sent; in redirect mo
 redirect mailbox. It exits non-zero when nothing was sent, and the message is recorded with template
 key `test_email`.
 
-Drafts are reviewed in Django admin (Email messages): administrators use the **Approve** and
-**Cancel** actions; message records are otherwise read-only.
+Drafts are reviewed in the app through the email API (see *Application emails*); Django admin
+(Email messages) also has **Approve** and **Cancel** actions for administrators. Message records are
+otherwise read-only.
 
 ### Local, safe testing
 
@@ -316,6 +319,78 @@ does not change any of them.
    setting `redirect` too). Templates are still Off.
 2. Turn one template to Auto or Draft only to exercise it, and inspect the redirected messages in
    the team mailbox (headers, SPF/DKIM pass, layout, copy).
-3. Set templates to **Draft** and let real drafts accumulate once triggers exist (Slice 2).
-4. Review real drafts in the admin; approve or cancel.
+3. Set the four application templates to **Draft** and let real drafts accumulate (Slice 2).
+4. Review real drafts in the application's Emails tab; edit, approve or cancel.
 5. Raise the ceiling to `enabled`, then move selected templates to **Auto** one at a time.
+
+## Application emails (v1.3.2, Slice 2)
+
+Four application workflows now prepare email through the Slice 1 foundation (same queue, worker,
+provider and safety controls). **All four templates stay Off after deployment**: an administrator
+must move a template to Draft (recommended first) or Auto before anything is created. Preparing an
+email never breaks the workflow that triggered it; a failure is logged and the workflow carries on.
+
+### Triggers
+
+| Template | Fires when | Not when | One per (`event_key`) |
+| --- | --- | --- | --- |
+| `application_received` | `submit_application` creates a **new** application (vendor form, staff, CSV import) | the submission is bundled into an open application; `backfill_applications`; migrations | application |
+| `call_follow_up` | a discovery or follow-up call is logged with outcome **No Answer** | any other outcome (Interested, Not Qualified, Callback Requested, Wrong Number…) | call task (repeat No Answers on the same task add nothing) |
+| `waitlist_update` | a **booth** line is waitlisted (`waitlist_line`) | add-on lines; the application itself is never "waitlisted" | application line |
+| `application_declined` | the application moves to **DECLINED** | WITHDRAWN; declining a single line | decision (`decided_at`), so decline → reopen → decline is two events |
+
+Each message stores the line it is about (`application_line`) and a small `trigger` snapshot (call
+task and attempt time, waitlist time, decision time; `{"manual": true}` for manual drafts). The
+waitlist email names the booth, market and dates through the new `{booth_name}` variable. The decline
+email never includes the internal decline reason. Callback tasks and call notes are unchanged.
+
+### Stop conditions (checked when prepared, when approved and just before sending)
+
+| Template | No longer applies when |
+| --- | --- |
+| `application_received` | the application is declined or withdrawn |
+| `call_follow_up` | the application is closed, or the vendor was reached on a later call (Interested, Not Qualified, Callback Requested) |
+| `waitlist_update` | the application is closed, or that line is no longer waitlisted (confirmed, declined, released) |
+| `application_declined` | the application is no longer declined, or it was declined again later (the email is for the earlier decision) |
+
+A queued email that no longer applies is **skipped** by the worker (`failure_code=stop_condition`).
+A draft that no longer applies cannot be approved, and the worker cancels it within a minute
+(reason "No longer applies: …", review task closed as cancelled), counted as `stale_cancelled`.
+
+### Drafts and review
+
+- A draft creates one **Review email** task, assigned to the application's reviewer, else the
+  vendor's owner, else unassigned (team queue). Its description points to the application's Emails tab.
+- Every signed-in team member can see and **edit** drafts (subject, HTML and text). Each edit keeps
+  the previous version as an `EmailDraftRevision` (append-only, numbered) and records an
+  `EMAIL_REVISED` activity event. Only drafts can be edited; the recipient and sender cannot be changed.
+- **Approve** and **Cancel** are for administrators, the review task's owner and the application's
+  reviewer. Approving queues the email for the next send window and completes the task; cancelling
+  (drafts or queued emails) cancels the task. Both are recorded in the activity timeline.
+- The task API refuses to close a review task while its draft is unresolved, and refuses to create
+  `EMAIL_REVIEW` tasks directly.
+- A team member can prepare a draft by hand from an application (`POST applications/{id}/emails/`),
+  whatever the template mode (the template must be active). It is refused when an identical draft is
+  already awaiting review, when the email does not apply, when a booth is required but not chosen, or
+  when the recipient address is missing, invalid or suppressed.
+
+### Email API (under `/api/v1/`)
+
+| Endpoint | Who | Notes |
+| --- | --- | --- |
+| `email/settings/` (GET, PATCH) | read: all; write: admins | stored and **effective** values, environment status, `live_sending_blocked`, `notices`; never credentials |
+| `email/templates/` (GET), `email/templates/{key}/` (GET, PATCH) | read: all; write: admins | PATCH `subject_template`, `html_template`, `text_template`, `mode`, `allowed_variables`; invalid placeholders answer 400 per field |
+| `email/templates/{key}/preview/` (POST) | all | `{application?, application_line?, market_weekend?}` plus optional unsaved template parts; returns `subject`, `html_body`, `text_body`, `data_source` (`application`/`sample`), `missing_variables` |
+| `email/messages/` (GET) | all | paginated; filters `application`, `vendor`, `market_weekend`, `application_line`, `template`, `status` (comma-separated), `bucket`; `search`, `ordering` |
+| `email/messages/{id}/` (GET, PATCH) | all | PATCH edits a draft: `{subject?, html_body?, text_body?, note?}` |
+| `email/messages/{id}/approve/`, `cancel/` (POST) | admins, task owner, reviewer | cancel takes `{reason}` |
+| `email/messages/{id}/revisions/` (GET) | all | previous versions, oldest first |
+| `email/overview/` (GET) | all | `counts` per bucket (each message counted once), `by_status`, `recent_activity` |
+| `applications/{id}/emails/` (GET, POST) | all | the application's messages (paginated); POST prepares a draft |
+
+Buckets: `awaiting_review` (draft), `queued` (queued, sending), `sent` (sent, delivered), `problems`
+(failed, bounced, complained), `not_sent` (skipped, cancelled). Every list and detail item carries
+`permissions {can_edit, can_approve, can_cancel}` for the current user and `no_longer_applies`
+(the stop-condition reason, or null). Full example responses and UI states are in
+[docs/email-frontend-guide.md](docs/email-frontend-guide.md); the manual testing checklist and known
+limitations are in [docs/email-slice-2-testing.md](docs/email-slice-2-testing.md).

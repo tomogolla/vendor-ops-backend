@@ -58,6 +58,16 @@ class TaskSerializer(serializers.ModelSerializer):
 
         task_type = attrs.get('task_type', getattr(self.instance, 'task_type', None))
         status = attrs.get('status', getattr(self.instance, 'status', Task.Status.TODO))
+        if task_type == Task.TaskType.EMAIL_REVIEW:
+            # Review email tasks belong to their draft: they are created with it and closed by
+            # approving or cancelling it, never by a normal task update.
+            if self.instance is None:
+                raise serializers.ValidationError({'task_type': 'Review email tasks are created with an email draft.'})
+            closing = 'status' in attrs and status not in Task.OPEN_STATUSES
+            if closing and self.instance.email_messages.filter(status='draft').exists():
+                raise serializers.ValidationError(
+                    {'status': 'Approve or cancel the email draft instead; that closes this task.'}
+                )
         if status in Task.OPEN_STATUSES and task_type in (Task.TaskType.DISCOVERY_CALL, Task.TaskType.APPLICATION_REVIEW):
             lookup = {'vendor': vendor} if task_type == Task.TaskType.DISCOVERY_CALL else {'application': application}
             if task_type == Task.TaskType.APPLICATION_REVIEW and not application:
