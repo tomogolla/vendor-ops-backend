@@ -34,7 +34,7 @@ from vendors.models import ActivityEvent
 from . import stop_conditions
 from .models import EmailMessage, EmailSettings, EmailTemplate
 from .providers import EmailProvider, EmailSendError, OutboundEmail, get_provider
-from .services import _activity, recipient_problem
+from .services import _activity, cancel_stale_drafts, recipient_problem
 from .windows import in_window
 
 logger = logging.getLogger('communications.sending')
@@ -50,6 +50,8 @@ class Summary:
     skipped: int = 0
     failed: int = 0
     deferred: int = 0
+    # Drafts cancelled because they no longer apply (application declined, line no longer waitlisted, ...).
+    stale_cancelled: int = 0
     dry_run: bool = False
     note: str = ''
 
@@ -254,6 +256,9 @@ def process_due_emails(*, limit: int = 50, dry_run: bool = False, now=None, prov
 
     if not dry_run:
         recover_stuck(now, summary)
+        # Whatever the sending mode: a draft that no longer applies should not sit in the review queue.
+        summary.stale_cancelled = cancel_stale_drafts()
+        summary.drafted -= summary.stale_cancelled
 
     mode = config.effective_mode
     if mode == EmailSettings.SendingMode.DISABLED:
