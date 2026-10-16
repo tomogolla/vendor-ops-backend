@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 
 from accounts.views import CsrfView, LoginView, LogoutView, MeView, TeamView, UserViewSet
 from catalog.views import MarketWeekendViewSet
+from communications.views import EmailMessageViewSet, EmailOverviewView, EmailSettingsView, EmailTemplateViewSet
 from imports.views import ImportConfirmView, ImportPreviewView
 from tasks.views import TaskViewSet
 from vendors.views import ApplicationLineViewSet, ApplicationViewSet, HealthView, VendorViewSet
@@ -15,6 +16,8 @@ router.register('application-lines', ApplicationLineViewSet, basename='applicati
 router.register('tasks', TaskViewSet, basename='task')
 router.register('users', UserViewSet, basename='user')
 router.register('market-weekends', MarketWeekendViewSet, basename='market-weekend')
+router.register('email/templates', EmailTemplateViewSet, basename='email-template')
+router.register('email/messages', EmailMessageViewSet, basename='email-message')
 
 api_v1 = [
     path('health/', HealthView.as_view(), name='health'),
@@ -25,6 +28,8 @@ api_v1 = [
     path('team/', TeamView.as_view(), name='team'),
     path('imports/vendors/preview/', ImportPreviewView.as_view(), name='import-preview'),
     path('imports/vendors/confirm/', ImportConfirmView.as_view(), name='import-confirm'),
+    path('email/settings/', EmailSettingsView.as_view(), name='email-settings'),
+    path('email/overview/', EmailOverviewView.as_view(), name='email-overview'),
     # Email delivery tracking (Resend via django-anymail); signed calls only.
     path('webhooks/anymail/', include('communications.urls')),
     path('', include(router.urls)),
