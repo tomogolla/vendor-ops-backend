@@ -7,4 +7,4 @@ class CommunicationsConfig(AppConfig):
     verbose_name = 'Email communications'
 
     def ready(self):
-        from . import checks  # noqa: F401  (registers system checks)
+        from . import checks, webhooks  # noqa: F401  (registers system checks and the tracking receiver)

@@ -252,6 +252,26 @@ Use the same database name, username, and password that previously worked. If th
 
 Secure cookies and forced HTTPS remain disabled only for the first HTTP deployment. They are enabled after Certbot is confirmed working.
 
+Email stays off until you choose otherwise. To use Resend (see the backend README, "Resend: setup"), add these to the same file; the API key and webhook signing secret live only here, never in a repository:
+
+```dotenv
+EMAIL_PROVIDER=resend
+EMAIL_GLOBAL_MODE=redirect
+EMAIL_FROM_ADDRESS=hello@thegoodflea.com
+EMAIL_REPLY_TO=hello@thegoodflea.com
+EMAIL_REDIRECT_TO=team-mailbox@thegoodflea.com
+EMAIL_RESEND_API_KEY=re_...
+EMAIL_RESEND_WEBHOOK_SECRET=whsec_...
+EMAIL_DAILY_LIMIT=90
+```
+
+In Resend, point the webhook at `https://ops.thegoodflea.com/api/v1/webhooks/anymail/resend/tracking/` (events: delivered, bounced, complained). nginx already proxies `/api/`, so no nginx change is needed. After editing the file, restart the API and send a test message:
+
+```sh
+sudo systemctl restart vendor-ops-backend
+sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py send_test_email you@thegoodflea.com
+```
+
 Check the protected file permissions without printing its contents:
 
 ```sh
@@ -443,6 +463,7 @@ curl --fail https://ops.thegoodflea.com/api/v1/health/
 sudo systemctl list-timers vendor-ops-send-emails.timer
 sudo journalctl -u vendor-ops-send-emails.service -n 50 --no-pager
 sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py send_due_emails --dry-run
+sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py send_test_email you@thegoodflea.com
 sudo systemctl stop vendor-ops-send-emails.timer   # emergency stop; the next deploy starts it again
 
 # List retained releases

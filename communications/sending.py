@@ -10,15 +10,22 @@ runs never pick the same message. Retry policy (conservative, explicit):
 - a message left in `sending` for EMAIL_STUCK_SENDING_MINUTES (the worker died mid-send) is
   marked failed, never re-sent, because it may already have been delivered;
 - a queued message more than EMAIL_QUEUE_MAX_AGE_HOURS past its scheduled time is skipped as
-  expired, so re-enabling sending never delivers a stale backlog.
+  expired, so re-enabling sending never delivers a stale backlog;
+- a provider rate-limit reply (HTTP 429) puts the message and the rest of the batch back in the
+  queue for EMAIL_RATE_LIMIT_DELAY_MINUTES without using up an attempt.
+
+EMAIL_DAILY_LIMIT caps messages sent since local midnight in the business time zone (0 = no
+limit). Once it is reached, the remaining messages simply stay queued for the next day.
 """
 
 import html
 import logging
 from dataclasses import asdict, dataclass
-from datetime import timedelta
+from datetime import datetime, time, timedelta, timezone as datetime_timezone
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
+from django.core.validators import validate_email
 from django.db import transaction
 from django.utils import timezone
 
@@ -145,19 +152,29 @@ def claim(now, limit: int, config: EmailSettings, summary: Summary) -> list[Emai
     return claimed
 
 
-def deliver(message: EmailMessage, provider: EmailProvider, config: EmailSettings, summary: Summary, now):
+def deliver(message: EmailMessage, provider: EmailProvider, config: EmailSettings, summary: Summary, now,
+            *, allow_retry: bool = True) -> str:
+    """Sends one claimed message. Returns 'sent', 'failed', 'retrying' or 'rate_limited'.
+    With allow_retry=False (one-off test emails) every failure is final."""
     email = outbound_for(message, config)
     try:
         result = provider.send(email)
     except EmailSendError as error:
-        _record_failure(message, error.code, error.detail, transient=error.transient, summary=summary, now=now)
-        return
+        if error.retry_later and allow_retry:
+            release(message, now, error.code, error.detail)
+            summary.deferred += 1
+            return 'rate_limited'
+        return _record_failure(message, error.code, error.detail, transient=error.transient and allow_retry,
+                               summary=summary, now=now)
     except Exception as error:  # noqa: BLE001 - one bad message must not stop the batch
         logger.exception('Unexpected error sending email %s', message.pk)
-        _record_failure(message, 'provider_error', f'Unexpected {type(error).__name__}.', transient=True, summary=summary, now=now)
-        return
+        return _record_failure(message, 'provider_error', f'Unexpected {type(error).__name__}.', transient=allow_retry,
+                               summary=summary, now=now)
     message.status = Status.SENT
-    message.sent_at = timezone.now()
+    # Use the worker's clock consistently. Besides making worker runs deterministic,
+    # this keeps the sent timestamp on the same local business day used by the
+    # daily-limit calculation.
+    message.sent_at = now
     message.provider = result.provider
     message.provider_message_id = result.message_id[:255]
     message.delivered_to_email = email.to_email
@@ -172,9 +189,42 @@ def deliver(message: EmailMessage, provider: EmailProvider, config: EmailSetting
               f'Email "{message.template_key}" sent{" (redirected to the team mailbox)" if message.redirected else ""}',
               redirected=message.redirected, provider=result.provider)
     summary.sent += 1
+    return 'sent'
 
 
-def _record_failure(message: EmailMessage, code: str, detail: str, *, transient: bool, summary: Summary, now):
+def release(message: EmailMessage, now, code: str = 'rate_limited', detail: str = ''):
+    """Back to the queue without using up an attempt (provider rate limit)."""
+    message.status = Status.QUEUED
+    message.attempt_count = max(message.attempt_count - 1, 0)
+    message.scheduled_for = now + timedelta(minutes=settings.EMAIL_RATE_LIMIT_DELAY_MINUTES)
+    message.failure_code = code
+    message.failure_detail = (detail or 'Provider rate limit; will try later.')[:500]
+    message.save(update_fields=['status', 'attempt_count', 'scheduled_for', 'failure_code', 'failure_detail', 'updated_at'])
+
+
+def local_midnight(now, config: EmailSettings) -> datetime:
+    if timezone.is_naive(now):
+        raise ValueError('Daily-limit calculations require a timezone-aware datetime.')
+    business_timezone = ZoneInfo(config.business_timezone)
+    local = now.astimezone(business_timezone)
+    local_start = datetime.combine(local.date(), time.min, tzinfo=business_timezone)
+    # Django stores DateTimeField values in UTC. Supplying the cutoff in UTC makes
+    # that conversion explicit and avoids mixing local and UTC boundaries.
+    return local_start.astimezone(datetime_timezone.utc)
+
+
+def daily_remaining(now, config: EmailSettings) -> int | None:
+    """Messages that may still be sent today, or None when there is no daily limit. Counts sends
+    since local midnight in the business time zone, plus messages being sent right now."""
+    limit = settings.EMAIL_DAILY_LIMIT
+    if not limit:
+        return None
+    used = EmailMessage.objects.filter(sent_at__gte=local_midnight(now, config)).count()
+    used += EmailMessage.objects.filter(status=Status.SENDING).count()
+    return max(limit - used, 0)
+
+
+def _record_failure(message: EmailMessage, code: str, detail: str, *, transient: bool, summary: Summary, now) -> str:
     message.failure_code = code
     message.failure_detail = detail[:500]
     message.provider = settings.EMAIL_PROVIDER
@@ -186,12 +236,13 @@ def _record_failure(message: EmailMessage, code: str, detail: str, *, transient:
         message.save(update_fields=['status', 'scheduled_for', 'failure_code', 'failure_detail', 'provider', 'updated_at'])
         logger.warning('Email %s attempt %s failed (%s); retrying in %s minutes', message.pk, message.attempt_count, code, delay)
         summary.deferred += 1
-        return
+        return 'retrying'
     message.status = Status.FAILED
     message.save(update_fields=['status', 'failure_code', 'failure_detail', 'provider', 'updated_at'])
     _activity(message, Event.EMAIL_FAILED, f'Email "{message.template_key}" failed: {detail}', reason=code,
               attempts=message.attempt_count)
     summary.failed += 1
+    return 'failed'
 
 
 def process_due_emails(*, limit: int = 50, dry_run: bool = False, now=None, provider: EmailProvider | None = None) -> Summary:
@@ -219,19 +270,94 @@ def process_due_emails(*, limit: int = 50, dry_run: bool = False, now=None, prov
         summary.note = 'outside the send window'
         return summary
 
+    remaining = daily_remaining(now, config)
+    if remaining == 0:
+        summary.deferred = due.count()
+        summary.note = _limit_note(summary.deferred, config)
+        return summary
+    batch_size = limit if remaining is None else min(limit, remaining)
+
     if dry_run:
-        for message in due.order_by('scheduled_for', 'created_at')[:limit]:
+        for message in due.order_by('scheduled_for', 'created_at')[:batch_size]:
             summary.scanned += 1
             if preflight(message, now, config):
                 summary.skipped += 1
             else:
                 summary.sent += 1
         summary.note = f'would send {summary.sent} in {mode} mode; nothing was changed'
+        if remaining is not None and due.count() > batch_size:
+            summary.note += f'; {_limit_note(due.count() - summary.scanned, config)}'
         return summary
 
     provider = provider or get_provider()
-    for message in claim(now, limit, config, summary):
-        deliver(message, provider, config, summary, now)
-    if mode == EmailSettings.SendingMode.REDIRECT:
-        summary.note = 'redirect mode'
+    claimed = claim(now, batch_size, config, summary)
+    notes = ['redirect mode'] if mode == EmailSettings.SendingMode.REDIRECT else []
+    for index, message in enumerate(claimed):
+        if deliver(message, provider, config, summary, now) == 'rate_limited':
+            for waiting in claimed[index + 1:]:
+                release(waiting, now)
+                summary.deferred += 1
+            notes.append('provider rate limit (HTTP 429): the rest will be retried shortly')
+            break
+    if remaining is not None and daily_remaining(now, config) == 0:
+        left = due.count()
+        if left:
+            summary.deferred += left
+            notes.append(_limit_note(left, config))
+    summary.note = '; '.join(notes)
     return summary
+
+
+def _limit_note(left: int, config: EmailSettings) -> str:
+    return (f'daily limit of {settings.EMAIL_DAILY_LIMIT} reached (since midnight {config.business_timezone}); '
+            f'{left} left queued')
+
+
+# --- One-off test email ----------------------------------------------------------------------
+
+@dataclass
+class TestEmailResult:
+    """`sent`, `failed`, `disabled`, `no_redirect_address`, `daily_limit`, `suppressed`, `missing_sender`."""
+    outcome: str
+    detail: str
+    message: EmailMessage | None = None
+
+
+def send_test_email(address: str, *, now=None, provider: EmailProvider | None = None) -> TestEmailResult:
+    """Sends one test message through the real path (EmailMessage record, mode, redirect, provider,
+    daily limit), without the send window and without retries."""
+    address = (address or '').strip()
+    validate_email(address)  # raises django.core.exceptions.ValidationError
+    now = now or timezone.now()
+    config = EmailSettings.load()
+    mode = config.effective_mode
+    if mode == EmailSettings.SendingMode.DISABLED:
+        return TestEmailResult('disabled', 'Sending is disabled (EMAIL_GLOBAL_MODE or the admin email settings); nothing was sent.')
+    if mode == EmailSettings.SendingMode.REDIRECT and not config.effective_redirect_to:
+        return TestEmailResult('no_redirect_address', 'Redirect mode is on but no redirect address is configured; nothing was sent.')
+    if not config.effective_sender_email:
+        return TestEmailResult('missing_sender', 'No sender address is configured (EMAIL_FROM_ADDRESS); nothing was sent.')
+    if daily_remaining(now, config) == 0:
+        return TestEmailResult('daily_limit', f'The daily limit of {settings.EMAIL_DAILY_LIMIT} is reached; nothing was sent.')
+    problem = recipient_problem(address, EmailTemplate.Category.TRANSACTIONAL)
+    if problem:
+        return TestEmailResult('suppressed', f'{problem[1]} Nothing was sent.')
+
+    stamp = now.astimezone(ZoneInfo(config.business_timezone)).strftime('%Y-%m-%d %H:%M %Z')
+    text = (f'This is a test email from Vendor Ops, sent {stamp} through the "{settings.EMAIL_PROVIDER}" provider '
+            f'in {mode} mode. No action is needed.')
+    message = EmailMessage.objects.create(
+        template_key='test_email', recipient_email=address, sender_name=config.effective_sender_name,
+        sender_email=config.effective_sender_email, reply_to_email=config.effective_reply_to,
+        subject='Vendor Ops test email', html_body=f'<p>{html.escape(text)}</p>', text_body=text,
+        status=Status.SENDING, scheduled_for=now, attempt_count=1, last_attempt_at=now,
+        event_key=f'test-email:{now.isoformat()}',
+    )
+    outcome = deliver(message, provider or get_provider(), config, Summary(), now, allow_retry=False)
+    message.refresh_from_db()
+    if outcome == 'sent':
+        where = (f'the redirect mailbox {message.delivered_to_email} instead of {address}'
+                 if message.redirected else message.delivered_to_email)
+        return TestEmailResult('sent', f'Sent to {where} via {message.provider} (provider message id '
+                                       f'{message.provider_message_id}).', message)
+    return TestEmailResult('failed', f'Not sent: {message.failure_code}: {message.failure_detail}', message)

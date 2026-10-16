@@ -176,8 +176,14 @@ class EmailMessage(models.Model):
         FAILED = 'failed', 'Failed'
         SKIPPED = 'skipped', 'Skipped'
         CANCELLED = 'cancelled', 'Cancelled'
+        # Set later by the provider's delivery webhook (Resend).
+        DELIVERED = 'delivered', 'Delivered'
+        BOUNCED = 'bounced', 'Bounced'
+        COMPLAINED = 'complained', 'Complained (marked as spam)'
 
-    FINAL_STATUSES = (Status.SENT, Status.FAILED, Status.SKIPPED, Status.CANCELLED)
+    FINAL_STATUSES = (
+        Status.SENT, Status.FAILED, Status.SKIPPED, Status.CANCELLED, Status.DELIVERED, Status.BOUNCED, Status.COMPLAINED,
+    )
     SNAPSHOT_FIELDS = (
         'template_id', 'template_key', 'vendor_id', 'application_id', 'market_weekend_id', 'recipient_name', 'recipient_email',
         'sender_name', 'sender_email', 'reply_to_email', 'subject', 'html_body', 'text_body', 'dedupe_key',
@@ -210,6 +216,7 @@ class EmailMessage(models.Model):
     status = models.CharField(max_length=10, choices=Status.choices)
     scheduled_for = models.DateTimeField(null=True, blank=True)
     sent_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True, help_text='From the provider webhook.')
     attempt_count = models.PositiveSmallIntegerField(default=0)
     last_attempt_at = models.DateTimeField(null=True, blank=True)
     delivered_to_email = models.CharField(

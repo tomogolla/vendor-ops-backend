@@ -33,6 +33,9 @@ env = environ.Env(
     EMAIL_SMTP_USERNAME=(str, ''),
     EMAIL_SMTP_PASSWORD=(str, ''),
     EMAIL_SMTP_TIMEOUT=(int, 20),
+    EMAIL_RESEND_API_KEY=(str, ''),
+    EMAIL_RESEND_WEBHOOK_SECRET=(str, ''),
+    EMAIL_DAILY_LIMIT=(int, 90),
 )
 environ.Env.read_env(BASE_DIR / '.env')
 
@@ -55,6 +58,7 @@ INSTALLED_APPS = [
     'vendors',
     'tasks',
     'imports',
+    'anymail',
     'communications.apps.CommunicationsConfig',
 ]
 
@@ -160,8 +164,8 @@ CURRENCY = 'USD'
 # --- Email (communications app) ------------------------------------------------
 # Django never sends from a web request: messages are queued in the database and the
 # `send_due_emails` command (systemd timer) delivers them. See README "Email".
-# Provider: `console` (Django's EMAIL_BACKEND; console locally, in-memory in tests) or
-# `smtp_relay` (Google Workspace SMTP relay, production only).
+# Provider: `console` (Django's EMAIL_BACKEND; console locally, in-memory in tests),
+# `smtp_relay` (Google Workspace SMTP relay) or `resend` (Resend API through django-anymail).
 EMAIL_PROVIDER = env('EMAIL_PROVIDER')
 # Ceiling for sending: disabled | redirect | enabled. The admin setting can only be stricter.
 EMAIL_GLOBAL_MODE = env('EMAIL_GLOBAL_MODE')
@@ -185,6 +189,19 @@ EMAIL_MAX_ATTEMPTS = 3
 EMAIL_RETRY_DELAYS_MINUTES = [5, 30]
 EMAIL_QUEUE_MAX_AGE_HOURS = 72
 EMAIL_STUCK_SENDING_MINUTES = 15
+# Messages sent per day (since local midnight in the business time zone); 0 = no limit.
+EMAIL_DAILY_LIMIT = env('EMAIL_DAILY_LIMIT')
+# After a provider rate-limit reply (HTTP 429), retry this much later without using an attempt.
+EMAIL_RATE_LIMIT_DELAY_MINUTES = 1
+
+# Resend through django-anymail. The API key and webhook signing secret come from the
+# environment only. Anymail reads them from ANYMAIL; the webhook refuses every call while no
+# signing secret is configured (communications/webhooks.py).
+EMAIL_RESEND_BACKEND = 'anymail.backends.resend.EmailBackend'
+ANYMAIL = {
+    'RESEND_API_KEY': env('EMAIL_RESEND_API_KEY'),
+    'RESEND_SIGNING_SECRET': env('EMAIL_RESEND_WEBHOOK_SECRET') or None,
+}
 # Used by the `console` provider. Never an SMTP backend: production delivery goes through the provider.
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 

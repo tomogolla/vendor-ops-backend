@@ -31,6 +31,18 @@ def email_settings_check(app_configs, **kwargs):
             problems.append(Error('EMAIL_FROM_ADDRESS is required with the smtp_relay provider.', id='communications.E005'))
         if not settings.EMAIL_SMTP.get('use_tls'):
             problems.append(Warning('EMAIL_SMTP_USE_TLS is off; the relay should use TLS.', id='communications.W001'))
+    if settings.EMAIL_PROVIDER == 'resend':
+        if not settings.ANYMAIL.get('RESEND_API_KEY'):
+            problems.append(Error('EMAIL_RESEND_API_KEY is required with the resend provider.', id='communications.E006'))
+        if not settings.EMAIL_FROM_ADDRESS:
+            problems.append(Error('EMAIL_FROM_ADDRESS is required with the resend provider.', id='communications.E007'))
+        if not settings.ANYMAIL.get('RESEND_SIGNING_SECRET'):
+            problems.append(Warning(
+                'EMAIL_RESEND_WEBHOOK_SECRET is empty: the delivery webhook refuses every call, so delivered, '
+                'bounced and complained statuses will not be recorded.', id='communications.W003',
+            ))
+    if settings.EMAIL_DAILY_LIMIT < 0:
+        problems.append(Error('EMAIL_DAILY_LIMIT must be 0 (no limit) or more.', id='communications.E008'))
     if settings.EMAIL_GLOBAL_MODE == 'redirect' and not settings.EMAIL_REDIRECT_TO:
         problems.append(Warning(
             'EMAIL_GLOBAL_MODE is redirect but EMAIL_REDIRECT_TO is empty; set it (or the admin redirect address) '
