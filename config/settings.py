@@ -36,6 +36,8 @@ env = environ.Env(
     EMAIL_RESEND_API_KEY=(str, ''),
     EMAIL_RESEND_WEBHOOK_SECRET=(str, ''),
     EMAIL_DAILY_LIMIT=(int, 90),
+    # Public application form (apply.thegoodflea.com). Off unless switched on.
+    PUBLIC_APPLICATIONS_ENABLED=(bool, False),
 )
 environ.Env.read_env(BASE_DIR / '.env')
 
@@ -127,7 +129,11 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_RENDERER_CLASSES': ['rest_framework.renderers.JSONRenderer'],
     'DEFAULT_THROTTLE_CLASSES': ['rest_framework.throttling.ScopedRateThrottle'],
-    'DEFAULT_THROTTLE_RATES': {'login': '10/min'},
+    'DEFAULT_THROTTLE_RATES': {
+        'login': '10/min',
+        # Public application form, per client IP. Mobile networks share addresses: do not go lower.
+        'public_weekends': '120/hour',
+    },
 }
 
 # --- Cookies, CORS and CSRF --------------------------------------------------
@@ -159,6 +165,10 @@ BUSINESS_HOURS = {
 }
 DISCOVERY_CALL_DUE_BUSINESS_HOURS = env('DISCOVERY_CALL_DUE_BUSINESS_HOURS')
 MAX_CALL_ATTEMPTS = 5
+
+# --- Public application form (see README "Public application form") --------------
+# Kill switch: when off, every /api/v1/public/ endpoint answers 404.
+PUBLIC_APPLICATIONS_ENABLED = env('PUBLIC_APPLICATIONS_ENABLED')
 # Money is stored as integer cents (`*_cents`); the currency code is for display only.
 CURRENCY = 'USD'
 

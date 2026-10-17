@@ -32,6 +32,8 @@ api_v1 = [
     path('email/overview/', EmailOverviewView.as_view(), name='email-overview'),
     # Email delivery tracking (Resend via django-anymail); signed calls only.
     path('webhooks/anymail/', include('communications.urls')),
+    # Public application form (no login); off unless PUBLIC_APPLICATIONS_ENABLED.
+    path('public/', include('public_api.urls')),
     path('', include(router.urls)),
 ]
 
