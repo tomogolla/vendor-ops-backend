@@ -16,6 +16,19 @@ from tasks.services import DUPLICATE_REVIEW_TITLE
 from vendors.models import ActivityEvent, Application, ApplicationLine, InternalNote, LeadIntakeEvent, Vendor
 
 URL = '/api/v1/public/applications/'
+# Cloudflare's documented always-pass test secret. Turnstile is never contacted from tests: siteverify
+# is mocked with a successful answer for the production hostname and the 'apply' action.
+TEST_SECRET = '1x0000000000000000000000000000000AA'
+
+
+def siteverify(success=True, codes=(), hostname='ops.thegoodflea.com', action='apply'):
+    response = mock.Mock(status_code=200)
+    response.raise_for_status.return_value = None
+    body = {'success': success, 'error-codes': list(codes)}
+    if success:
+        body.update({'hostname': hostname, 'action': action, 'challenge_ts': '2026-10-17T12:00:00Z'})
+    response.json.return_value = body
+    return response
 
 
 def payload(**overrides):
@@ -28,8 +41,8 @@ def payload(**overrides):
     return data
 
 
-# Limits are relaxed here; test_protection.py covers them. DEBUG with no secret skips Turnstile.
-@override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=True, TURNSTILE_SECRET_KEY='', PUBLIC_APPLICATIONS_EMAIL_LIMIT_PER_DAY=50)
+# Limits are relaxed here; test_protection.py covers them and Turnstile itself.
+@override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=False, TURNSTILE_SECRET_KEY=TEST_SECRET, PUBLIC_APPLICATIONS_EMAIL_LIMIT_PER_DAY=50)
 class PublicSubmissionTestCase(ApiTestCase):
     @classmethod
     def setUpTestData(cls):
@@ -49,6 +62,9 @@ class PublicSubmissionTestCase(ApiTestCase):
         rates = mock.patch.dict(ScopedRateThrottle.THROTTLE_RATES, {'public_apply': '1000/hour'})
         rates.start()
         self.addCleanup(rates.stop)
+        patcher = mock.patch('public_api.turnstile.requests.post', return_value=siteverify())
+        self.siteverify = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def submit(self, **overrides):
         overrides.setdefault('weekend_ids', [str(self.first.pk), str(self.second.pk)])

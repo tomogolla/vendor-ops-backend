@@ -1,4 +1,6 @@
-"""Step 4: Turnstile, kill switch, throttles (not spoofable), per-email limit, daily cap, checks."""
+"""Turnstile (with hostname and action), kill switch, throttles (not spoofable), per-email limit,
+daily cap and system checks. Cloudflare is never contacted: siteverify is mocked, and only
+Cloudflare's documented test keys are used."""
 
 from unittest import mock
 
@@ -11,24 +13,28 @@ from rest_framework.test import APIClient
 from rest_framework.throttling import ScopedRateThrottle
 
 from config.testing import ApiTestCase
-from vendors.models import Application, Vendor
+from vendors.models import Application, LeadIntakeEvent, Vendor
 
 from ..checks import public_form_check
-from .test_submit import URL, PublicSubmissionTestCase, payload
+from .test_submit import TEST_SECRET, URL, PublicSubmissionTestCase, payload, siteverify
 
-# Cloudflare's documented always-pass test secret; requests.post is mocked, nothing leaves the machine.
-SECRET = '1x0000000000000000000000000000000AA'
-
-
-def siteverify(success=True, codes=()):
-    response = mock.Mock(status_code=200)
-    response.raise_for_status.return_value = None
-    response.json.return_value = {'success': success, 'error-codes': list(codes)}
-    return response
+FAIL_SECRET = '2x0000000000000000000000000000000AA'
+NOT_VERIFIED = {'detail': 'We could not verify that you are not a robot. Please try again.'}
 
 
-@override_settings(DEBUG=False, TURNSTILE_SECRET_KEY=SECRET)
 class TurnstileTests(PublicSubmissionTestCase):
+    def verify_with(self, response=None, **submit):
+        with mock.patch('public_api.turnstile.requests.post', return_value=response or siteverify()) as post:
+            result = self.submit(**submit)
+        return result, post
+
+    def assert_refused(self, response, status=400):
+        self.assertEqual(response.status_code, status, response.content)
+        if status == 400:
+            self.assertEqual(response.json(), NOT_VERIFIED)
+        self.assertFalse(Vendor.objects.exists())
+        self.assertFalse(LeadIntakeEvent.objects.exists())
+
     def test_pass_sends_secret_token_and_the_nginx_client_ip(self):
         with mock.patch('public_api.turnstile.requests.post', return_value=siteverify()) as post:
             response = self.client.post(URL, payload(weekend_ids=[str(self.first.pk)]), format='json',
@@ -36,48 +42,92 @@ class TurnstileTests(PublicSubmissionTestCase):
         self.assertEqual(response.json(), {'status': 'received'})
         self.assertTrue(Application.objects.exists())
         self.assertEqual(post.call_args.args[0], 'https://challenges.cloudflare.com/turnstile/v0/siteverify')
-        self.assertEqual(post.call_args.kwargs['data'], {'secret': SECRET, 'response': 'XXXX.DUMMY.TOKEN.XXXX', 'remoteip': '203.0.113.5'})
+        self.assertEqual(post.call_args.kwargs['data'], {'secret': TEST_SECRET, 'response': 'XXXX.DUMMY.TOKEN.XXXX', 'remoteip': '203.0.113.5'})
         self.assertEqual(post.call_args.kwargs['timeout'], 5)
+
+    def test_verified_before_anything_is_created(self):
+        def check_nothing_yet(*args, **kwargs):
+            self.assertFalse(Vendor.objects.exists())
+            self.assertFalse(Application.objects.exists())
+            return siteverify()
+        with mock.patch('public_api.turnstile.requests.post', side_effect=check_nothing_yet) as post:
+            self.assertEqual(self.submit().status_code, 200)
+        post.assert_called_once()
 
     def test_no_reliable_ip_means_no_remoteip(self):
         with mock.patch('public_api.turnstile.requests.post', return_value=siteverify()) as post:
             self.client.post(URL, payload(weekend_ids=[str(self.first.pk)]), format='json', REMOTE_ADDR='')
         self.assertNotIn('remoteip', post.call_args.kwargs['data'])
 
-    def test_failure_refuses_and_creates_nothing(self):
-        with mock.patch('public_api.turnstile.requests.post', return_value=siteverify(False, ['invalid-input-response'])):
-            response = self.submit()
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json(), {'detail': 'We could not verify that you are not a robot. Please try again.'})
-        self.assertFalse(Vendor.objects.exists())
+    def test_missing_token_never_calls_out(self):
+        for token in ('', None):
+            response, post = self.verify_with(turnstile_token=token)
+            self.assert_refused(response)
+            post.assert_not_called()
+        data = payload(weekend_ids=[str(self.first.pk)])
+        data.pop('turnstile_token')
+        with mock.patch('public_api.turnstile.requests.post') as post:
+            self.assert_refused(self.client.post(URL, data, format='json'))
+        post.assert_not_called()
 
-    def test_reused_token_fails(self):
-        with mock.patch('public_api.turnstile.requests.post', return_value=siteverify(False, ['timeout-or-duplicate'])):
-            self.assertEqual(self.submit().status_code, 400)
+    def test_invalid_expired_and_reused_tokens_are_refused(self):
+        for codes in (['invalid-input-response'], ['timeout-or-duplicate'], ['missing-input-response'], []):
+            response, _ = self.verify_with(siteverify(False, codes))
+            self.assert_refused(response)
+
+    def test_wrong_hostname_or_action_is_refused(self):
+        for answer in (siteverify(hostname='evil.example.com'), siteverify(hostname=''), siteverify(action='login'), siteverify(action='')):
+            response, _ = self.verify_with(answer)
+            self.assert_refused(response)
+
+    @override_settings(TURNSTILE_EXPECTED_HOSTNAMES=['ops.thegoodflea.com', 'staging.thegoodflea.com'])
+    def test_any_configured_hostname_is_accepted(self):
+        response, _ = self.verify_with(siteverify(hostname='staging.thegoodflea.com'))
+        self.assertEqual(response.status_code, 200)
 
     def test_unreachable_or_misconfigured_fails_closed(self):
         for effect in (requests.ConnectionError('down'), requests.Timeout('slow')):
             with mock.patch('public_api.turnstile.requests.post', side_effect=effect):
-                self.assertEqual(self.submit().status_code, 503)
-        with mock.patch('public_api.turnstile.requests.post', return_value=siteverify(False, ['invalid-input-secret'])):
-            self.assertEqual(self.submit().status_code, 503)
+                self.assert_refused(self.submit(), 503)
+        for codes in (['invalid-input-secret'], ['missing-input-secret'], ['internal-error'], ['bad-request']):
+            response, _ = self.verify_with(siteverify(False, codes))
+            self.assert_refused(response, 503)
         broken = siteverify()
         broken.json.side_effect = ValueError('not json')
-        with mock.patch('public_api.turnstile.requests.post', return_value=broken):
-            self.assertEqual(self.submit().status_code, 503)
-        self.assertFalse(Vendor.objects.exists())
+        self.assert_refused(self.verify_with(broken)[0], 503)
+        listy = siteverify()
+        listy.json.return_value = ['success']
+        self.assert_refused(self.verify_with(listy)[0], 503)
 
-    def test_missing_token_never_calls_out(self):
-        with mock.patch('public_api.turnstile.requests.post') as post:
-            self.assertEqual(self.submit(turnstile_token='').status_code, 400)
-        post.assert_not_called()
+    @override_settings(TURNSTILE_SECRET_KEY=FAIL_SECRET)
+    def test_failing_test_secret(self):
+        self.assert_refused(self.verify_with(siteverify(False, ['invalid-input-response']))[0])
 
     @override_settings(TURNSTILE_SECRET_KEY='')
-    def test_production_without_secret_refuses(self):
-        with mock.patch('public_api.turnstile.requests.post') as post:
-            self.assertEqual(self.submit().status_code, 503)
+    def test_missing_secret_refuses_in_production(self):
+        response, post = self.verify_with()
+        self.assert_refused(response, 503)
         post.assert_not_called()
-        self.assertFalse(Vendor.objects.exists())
+
+    @override_settings(TURNSTILE_SECRET_KEY='', DEBUG=True)
+    def test_missing_secret_refuses_in_development_too(self):
+        response, post = self.verify_with()
+        self.assert_refused(response, 503)
+        post.assert_not_called()
+
+    @override_settings(DEBUG=True)
+    def test_test_secret_in_development_ignores_placeholder_hostname(self):
+        response, _ = self.verify_with(siteverify(hostname='example.com', action='test'))
+        self.assertEqual(response.status_code, 200)
+
+    @override_settings(DEBUG=True, TURNSTILE_SECRET_KEY='0x4AAAAAAA-real-looking-secret')
+    def test_real_secret_in_development_still_checks_hostname(self):
+        self.assert_refused(self.verify_with(siteverify(hostname='localhost'))[0])
+
+    def test_retry_with_a_new_token_after_a_failure(self):
+        self.assert_refused(self.verify_with(siteverify(False, ['timeout-or-duplicate']))[0])
+        response, _ = self.verify_with(turnstile_token='a-fresh-token')
+        self.assertEqual(response.json(), {'status': 'received'})
 
 
 class LimitTests(PublicSubmissionTestCase):
@@ -113,8 +163,14 @@ class LimitTests(PublicSubmissionTestCase):
             self.assertEqual(self.submit(consent=False).status_code, 400)
         self.assertEqual(self.submit().status_code, 200)
 
+    def test_repeat_submission_is_deduplicated_into_one_application(self):
+        self.assertEqual(self.submit().json(), {'status': 'received'})
+        self.assertEqual(self.submit().json(), {'status': 'received'})
+        self.assertEqual(Vendor.objects.count(), 1)
+        self.assertEqual(Application.objects.count(), 1)
 
-@override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=True, TURNSTILE_SECRET_KEY='')
+
+@override_settings(PUBLIC_APPLICATIONS_ENABLED=True, TURNSTILE_SECRET_KEY=TEST_SECRET)
 class ThrottleIdentityTests(ApiTestCase):
     def setUp(self):
         cache.clear()
@@ -142,16 +198,24 @@ class ThrottleIdentityTests(ApiTestCase):
 
 
 class SettingsTests(ApiTestCase):
-    def test_check_errors_when_on_in_production_without_secret(self):
-        with override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=False, TURNSTILE_SECRET_KEY=''):
-            self.assertEqual([problem.id for problem in public_form_check(None)], ['public_api.E001'])
-        with override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=False, TURNSTILE_SECRET_KEY=SECRET):
-            self.assertEqual([problem.id for problem in public_form_check(None)], ['public_api.W001'])
-        with override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=False, TURNSTILE_SECRET_KEY='0x4AAA-real-looking'):
-            self.assertEqual(public_form_check(None), [])
-        for enabled, debug in ((False, False), (True, True)):
-            with override_settings(PUBLIC_APPLICATIONS_ENABLED=enabled, DEBUG=debug, TURNSTILE_SECRET_KEY=''):
-                self.assertEqual(public_form_check(None), [])
+    def ids(self, **overrides):
+        values = {'PUBLIC_APPLICATIONS_ENABLED': True, 'DEBUG': False, 'TURNSTILE_SECRET_KEY': '0x4AAA-real-looking',
+                  'TURNSTILE_EXPECTED_HOSTNAMES': ['ops.thegoodflea.com'], 'TURNSTILE_EXPECTED_ACTION': 'apply', **overrides}
+        with override_settings(**values):
+            return [problem.id for problem in public_form_check(None)]
+
+    def test_production_checks(self):
+        self.assertEqual(self.ids(), [])
+        self.assertEqual(self.ids(TURNSTILE_SECRET_KEY=''), ['public_api.E001'])
+        self.assertEqual(self.ids(TURNSTILE_SECRET_KEY=TEST_SECRET), ['public_api.W001'])
+        self.assertEqual(self.ids(TURNSTILE_EXPECTED_HOSTNAMES=[]), ['public_api.E002'])
+        self.assertEqual(self.ids(TURNSTILE_EXPECTED_ACTION=''), ['public_api.E003'])
+        self.assertEqual(self.ids(PUBLIC_APPLICATIONS_ENABLED=False, TURNSTILE_SECRET_KEY=''), [])
+        self.assertEqual(self.ids(DEBUG=True, TURNSTILE_SECRET_KEY=''), [])
+
+    def test_defaults(self):
+        self.assertEqual((settings.TURNSTILE_EXPECTED_HOSTNAMES, settings.TURNSTILE_EXPECTED_ACTION), (['ops.thegoodflea.com'], 'apply'))
+        self.assertFalse(settings.PUBLIC_APPLICATIONS_ENABLED)
 
     def test_shared_cache_outside_tests_memory_in_tests(self):
         self.assertEqual(settings.CACHES['default']['BACKEND'], 'django.core.cache.backends.locmem.LocMemCache')
