@@ -196,6 +196,8 @@ class ApplicationSerializer(serializers.ModelSerializer):
     has_waitlisted_lines = serializers.SerializerMethodField()
     call_attempts = serializers.SerializerMethodField()
     next_task_due_at = serializers.SerializerMethodField()
+    requested_weekends = serializers.SerializerMethodField(help_text='Weekends the applicant asked for: [{id, label}].')
+    campaign = serializers.SerializerMethodField(help_text="utm_campaign of the vendor's latest intake event, or blank.")
 
     class Meta:
         model = Application
@@ -206,7 +208,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
             'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
             'lines', 'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
-            'decision', 'decision_reason', 'decided_at', 'updated_at',
+            'decision', 'decision_reason', 'decided_at', 'updated_at', 'requested_weekends', 'campaign',
         ]
         read_only_fields = [
             'id', 'submitted_by', 'submitted_at', 'social_snapshot', 'stage', 'stage_entered_at', 'legacy_status',
@@ -242,6 +244,16 @@ class ApplicationSerializer(serializers.ModelSerializer):
             return application.next_task_due_at
         task = application.tasks.filter(status__in=Task.OPEN_STATUSES, due_at__isnull=False).order_by('due_at').first()
         return task.due_at if task else None
+
+    def get_requested_weekends(self, application) -> list[dict]:
+        return [{'id': str(weekend.pk), 'label': weekend.label} for weekend in application.requested_weekends.all()]
+
+    def get_campaign(self, application) -> str:
+        annotated = getattr(application, 'campaign', None)
+        if annotated is not None:
+            return annotated
+        latest = application.vendor.intake_events.order_by('-captured_at').first()
+        return str((latest.metadata or {}).get('utm_campaign') or '') if latest else ''
 
     def to_representation(self, application):
         """Adds currency, requested_total_cents, confirmed_subtotal_cents, discount_cents and

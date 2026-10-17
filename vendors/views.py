@@ -13,7 +13,7 @@ from tasks.models import Task
 
 from . import pipeline, services
 from .filters import ApplicationFilter, VendorFilter
-from .models import Application, ApplicationLine, Vendor, vendor_label_expression
+from .models import Application, ApplicationLine, Vendor, campaign_expression, vendor_label_expression
 from .serializers import (
     VENDOR_EDITABLE_FIELDS,
     ActivityEventSerializer,
@@ -168,8 +168,9 @@ class ApplicationViewSet(
         calls = Task.objects.filter(application=OuterRef('pk'), task_type=Task.TaskType.DISCOVERY_CALL)
         open_tasks = Task.objects.filter(application=OuterRef('pk'), status__in=Task.OPEN_STATUSES, due_at__isnull=False)
         return Application.objects.select_related('vendor', 'reviewer', 'submitted_by').prefetch_related(
-            Prefetch('lines', queryset=LINES_QUERYSET),
+            Prefetch('lines', queryset=LINES_QUERYSET), 'requested_weekends',
         ).annotate(
+            campaign=campaign_expression(),
             call_exhausted=Exists(pipeline.exhausted_calls().filter(application=OuterRef('pk'))),
             call_attempts=Coalesce(
                 Subquery(calls.values('application').annotate(total=Sum('attempt_count')).values('total')), 0,

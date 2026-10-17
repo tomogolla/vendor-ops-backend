@@ -60,6 +60,7 @@ INSTALLED_APPS = [
     'imports',
     'anymail',
     'communications.apps.CommunicationsConfig',
+    'public_api.apps.PublicApiConfig',
 ]
 
 MIDDLEWARE = [
