@@ -42,6 +42,9 @@ env = environ.Env(
     PUBLIC_APPLICATION_CONSENT_VERSION=(str, '2026-10'),
     PUBLIC_APPLICATIONS_DAILY_CAP=(int, 200),
     TURNSTILE_SECRET_KEY=(str, ''),
+    TURNSTILE_EXPECTED_HOSTNAMES=(list, []),
+    TURNSTILE_EXPECTED_HOSTNAME=(str, ''),  # single-host spelling, accepted as well
+    TURNSTILE_EXPECTED_ACTION=(str, 'apply'),
 )
 environ.Env.read_env(BASE_DIR / '.env')
 
@@ -191,9 +194,15 @@ PUBLIC_APPLICATION_CONSENT_VERSION = env('PUBLIC_APPLICATION_CONSENT_VERSION')
 # Website-form applications created per day (business time zone); more answer 503.
 PUBLIC_APPLICATIONS_DAILY_CAP = env('PUBLIC_APPLICATIONS_DAILY_CAP')
 PUBLIC_APPLICATIONS_EMAIL_LIMIT_PER_DAY = 3
-# Cloudflare Turnstile secret (server environment only). Required when the form is on and DEBUG is
-# off (system check); with DEBUG on and no secret, verification is skipped for local development.
+# Cloudflare Turnstile secret (server environment only). Without it no submission is accepted, in
+# any environment; local development uses Cloudflare's test secret. A verified token must also come
+# from one of these hostnames and carry this action (the page renders the widget with it).
 TURNSTILE_SECRET_KEY = env('TURNSTILE_SECRET_KEY')
+TURNSTILE_EXPECTED_HOSTNAMES = [
+    host.strip().lower() for host in (env('TURNSTILE_EXPECTED_HOSTNAMES') or [env('TURNSTILE_EXPECTED_HOSTNAME') or 'ops.thegoodflea.com'])
+    if host.strip()
+]
+TURNSTILE_EXPECTED_ACTION = env('TURNSTILE_EXPECTED_ACTION')
 TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify'
 TURNSTILE_TIMEOUT_SECONDS = 5
 # Money is stored as integer cents (`*_cents`); the currency code is for display only.

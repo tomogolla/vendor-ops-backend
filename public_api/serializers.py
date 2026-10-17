@@ -37,7 +37,8 @@ class PublicApplicationSerializer(serializers.Serializer):
     booth_size = CleanCharField(max_length=100)
     consent = serializers.BooleanField()
     consent_text_version = CleanCharField(max_length=50, required=False, allow_blank=True, default='')
-    turnstile_token = serializers.CharField(max_length=2048, required=False, allow_blank=True, default='', trim_whitespace=True)
+    # Missing, blank or null all reach Turnstile verification, which refuses them with its own message.
+    turnstile_token = serializers.CharField(max_length=4096, required=False, allow_blank=True, allow_null=True, default='', trim_whitespace=True)
     # Honeypot: checked by the view before validation; anything here means a bot.
     website = serializers.CharField(required=False, allow_blank=True, default='')
     attribution = serializers.DictField(required=False, default=dict)
