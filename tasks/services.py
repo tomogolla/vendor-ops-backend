@@ -35,6 +35,19 @@ def _create_unique_open_task(lookup: dict, defaults: dict, actor) -> tuple[Task,
     return task, True
 
 
+DUPLICATE_REVIEW_TITLE = 'Possible duplicate vendor: review web application'
+
+
+def open_duplicate_review(vendor: Vendor, application: Application, *, actor, description: str) -> Task:
+    """A team-queue follow-up when a web submission matched more than one vendor."""
+    task, _ = _create_unique_open_task(
+        {'vendor': vendor, 'application': application, 'task_type': Task.TaskType.FOLLOW_UP, 'title': DUPLICATE_REVIEW_TITLE},
+        {'owner': None, 'priority': Task.Priority.HIGH, 'description': description, 'due_at': discovery_call_due_at()},
+        actor,
+    )
+    return task
+
+
 def already_reached(vendor: Vendor) -> bool:
     """A first-contact call already succeeded, so another discovery call is not needed."""
     return Task.objects.filter(

@@ -38,6 +38,7 @@ env = environ.Env(
     EMAIL_DAILY_LIMIT=(int, 90),
     # Public application form (apply.thegoodflea.com). Off unless switched on.
     PUBLIC_APPLICATIONS_ENABLED=(bool, False),
+    PUBLIC_APPLICATION_CONSENT_VERSION=(str, '2026-10'),
 )
 environ.Env.read_env(BASE_DIR / '.env')
 
@@ -169,6 +170,8 @@ MAX_CALL_ATTEMPTS = 5
 # --- Public application form (see README "Public application form") --------------
 # Kill switch: when off, every /api/v1/public/ endpoint answers 404.
 PUBLIC_APPLICATIONS_ENABLED = env('PUBLIC_APPLICATIONS_ENABLED')
+# Recorded with each submission's consent when the page does not send its own consent_text_version.
+PUBLIC_APPLICATION_CONSENT_VERSION = env('PUBLIC_APPLICATION_CONSENT_VERSION')
 # Money is stored as integer cents (`*_cents`); the currency code is for display only.
 CURRENCY = 'USD'
 
