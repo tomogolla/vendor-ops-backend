@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import environ
@@ -39,6 +40,8 @@ env = environ.Env(
     # Public application form (apply.thegoodflea.com). Off unless switched on.
     PUBLIC_APPLICATIONS_ENABLED=(bool, False),
     PUBLIC_APPLICATION_CONSENT_VERSION=(str, '2026-10'),
+    PUBLIC_APPLICATIONS_DAILY_CAP=(int, 200),
+    TURNSTILE_SECRET_KEY=(str, ''),
 )
 environ.Env.read_env(BASE_DIR / '.env')
 
@@ -99,6 +102,14 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {'default': env.db('DATABASE_URL')}
 DATABASES['default']['ATOMIC_REQUESTS'] = True
 
+# Shared by every gunicorn worker (throttle counters must not be per process): a database cache
+# table, created on deploy with `manage.py createcachetable` (idempotent). Tests use memory.
+TESTING = len(sys.argv) > 1 and sys.argv[1] == 'test'
+CACHES = {
+    'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache', 'LOCATION': 'tests'} if TESTING
+    else env.cache('CACHE_URL', default='dbcache://django_cache'),
+}
+
 AUTH_USER_MODEL = 'accounts.User'
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -134,7 +145,12 @@ REST_FRAMEWORK = {
         'login': '10/min',
         # Public application form, per client IP. Mobile networks share addresses: do not go lower.
         'public_weekends': '120/hour',
+        'public_apply': '10/hour',
     },
+    # gunicorn listens on a unix socket behind exactly one proxy (nginx), which appends the real
+    # client address to X-Forwarded-For: throttles use that last entry, so a client-sent prefix
+    # cannot change who is being counted.
+    'NUM_PROXIES': 1,
 }
 
 # --- Cookies, CORS and CSRF --------------------------------------------------
@@ -172,6 +188,14 @@ MAX_CALL_ATTEMPTS = 5
 PUBLIC_APPLICATIONS_ENABLED = env('PUBLIC_APPLICATIONS_ENABLED')
 # Recorded with each submission's consent when the page does not send its own consent_text_version.
 PUBLIC_APPLICATION_CONSENT_VERSION = env('PUBLIC_APPLICATION_CONSENT_VERSION')
+# Website-form applications created per day (business time zone); more answer 503.
+PUBLIC_APPLICATIONS_DAILY_CAP = env('PUBLIC_APPLICATIONS_DAILY_CAP')
+PUBLIC_APPLICATIONS_EMAIL_LIMIT_PER_DAY = 3
+# Cloudflare Turnstile secret (server environment only). Required when the form is on and DEBUG is
+# off (system check); with DEBUG on and no secret, verification is skipped for local development.
+TURNSTILE_SECRET_KEY = env('TURNSTILE_SECRET_KEY')
+TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify'
+TURNSTILE_TIMEOUT_SECONDS = 5
 # Money is stored as integer cents (`*_cents`); the currency code is for display only.
 CURRENCY = 'USD'
 

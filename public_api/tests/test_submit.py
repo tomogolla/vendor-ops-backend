@@ -6,6 +6,7 @@ from unittest import mock
 from django.core.cache import cache
 from django.test import override_settings
 from rest_framework.test import APIClient
+from rest_framework.throttling import ScopedRateThrottle
 
 from catalog.models import BoothVariant, MarketWeekend
 from communications.models import EmailMessage, EmailTemplate
@@ -27,7 +28,8 @@ def payload(**overrides):
     return data
 
 
-@override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=True, TURNSTILE_SECRET_KEY='')
+# Limits are relaxed here; test_protection.py covers them. DEBUG with no secret skips Turnstile.
+@override_settings(PUBLIC_APPLICATIONS_ENABLED=True, DEBUG=True, TURNSTILE_SECRET_KEY='', PUBLIC_APPLICATIONS_EMAIL_LIMIT_PER_DAY=50)
 class PublicSubmissionTestCase(ApiTestCase):
     @classmethod
     def setUpTestData(cls):
@@ -44,6 +46,9 @@ class PublicSubmissionTestCase(ApiTestCase):
         super().setUp()
         cache.clear()
         self.client = APIClient(enforce_csrf_checks=True)
+        rates = mock.patch.dict(ScopedRateThrottle.THROTTLE_RATES, {'public_apply': '1000/hour'})
+        rates.start()
+        self.addCleanup(rates.stop)
 
     def submit(self, **overrides):
         overrides.setdefault('weekend_ids', [str(self.first.pk), str(self.second.pk)])
