@@ -539,81 +539,76 @@ Recheck only the `DATABASE_URL` in `/etc/vendor-ops/backend.env`. Confirm the da
 This is expected after a previous installation. Select the option to reinstall the existing certificate unless it is expired or covers a different domain.
 
 
-## Public application form (apply.thegoodflea.com)
+## Public application form (ops.thegoodflea.com/apply)
 
-The public form is **off** until you switch it on (`PUBLIC_APPLICATIONS_ENABLED=false` by default:
-its endpoints answer 404). These steps add the site; do them once, in order. See the backend README,
-"Public application form", for what the form does and how it is protected.
+The public vendor application page is served by the existing site at
+**https://ops.thegoodflea.com/apply**. No new domain, DNS record, server or certificate is needed: nginx
+already serves the frontend and proxies `/api/` to Django. The page uses only the public endpoints
+(`/api/v1/public/…`), which need no login; the staff API keeps requiring a signed-in team member.
 
-### 1. DNS record (in Shopify)
+The form is **off** until you switch it on (`PUBLIC_APPLICATIONS_ENABLED=false` by default: its
+endpoints answer 404 and the page says applications are closed). See the backend README, "Public
+application form", for what the form does and how it is protected.
 
-`thegoodflea.com` DNS is managed in Shopify (Settings → Domains → thegoodflea.com → DNS settings).
-Add:
+### 1. Create the Turnstile widget (Cloudflare dashboard)
 
-| Type | Host/name | Value |
-|---|---|---|
-| A | `apply` | The droplet’s public IPv4 address (the same as `ops`) |
+1. Sign in to Cloudflare (a free account is enough; the domain does not need to use Cloudflare DNS)
+   and open **Turnstile → Add widget**.
+2. Name it "Vendor application", add the hostname **`ops.thegoodflea.com`**, and choose the widget
+   mode **Managed**. Do not add `localhost` to the production widget; local development uses
+   Cloudflare's test keys instead.
+3. Copy the **site key** (public; it goes into the frontend build) and the **secret key** (private; it
+   goes only into the server environment below). Never commit or paste the secret key anywhere else.
 
-Check from your computer before continuing:
-
-```sh
-nslookup apply.thegoodflea.com
-```
-
-Do not put a proxy or CDN in front of this name (for example Cloudflare’s orange-cloud proxy): Django
-counts abuse limits by the last address in `X-Forwarded-For`, which must be the one nginx adds.
-
-### 2. Cloudflare Turnstile
-
-In the Cloudflare dashboard (a free account is enough), open Turnstile, add a widget for the hostname
-`apply.thegoodflea.com`, and copy the **site key** (it goes into the frontend build) and the **secret
-key** (it goes only into the server environment below). Never commit the secret key.
-
-### 3. Server environment
+### 2. Backend environment (the droplet)
 
 ```sh
 sudoedit /etc/vendor-ops/backend.env
 ```
 
-Add the host and the form settings (keep everything else):
+Add (keep everything else):
 
 ```dotenv
-DJANGO_ALLOWED_HOSTS=ops.thegoodflea.com,apply.thegoodflea.com,127.0.0.1,localhost
 TURNSTILE_SECRET_KEY=the-secret-key-from-cloudflare
+TURNSTILE_EXPECTED_HOSTNAMES=ops.thegoodflea.com
+TURNSTILE_EXPECTED_ACTION=apply
 PUBLIC_APPLICATIONS_DAILY_CAP=200
 PUBLIC_APPLICATIONS_ENABLED=false
 ```
 
-`CSRF_TRUSTED_ORIGINS` does not need the apply host: the public endpoints use no session or CSRF
-cookie, and the page calls them on its own host. CORS is not needed for the same reason.
+- Every token is verified with Cloudflare before anything is created, and it must have been issued
+  for `ops.thegoodflea.com` with the action `apply` (the page renders the widget with that action).
+  Missing, invalid, expired and already-used tokens are refused.
+- There is **no bypass**: without `TURNSTILE_SECRET_KEY` the endpoint refuses every submission (503),
+  and `manage.py check` fails when the form is on in production without the secret
+  (`public_api.E001`), without an expected hostname (`E002`) or without an expected action (`E003`).
+  It warns (`W001`) if a Cloudflare test secret is used in production.
+- `DJANGO_ALLOWED_HOSTS` and `CSRF_TRUSTED_ORIGINS` need no change: the page is on the existing host,
+  and the public endpoints use no session or CSRF cookie.
 
-### 4. nginx site
+### 3. Frontend site key (frontend build)
 
-```sh
-sudo install -m 0644 /opt/vendor-ops/backend-current/deploy/nginx-apply.thegoodflea.com.conf /etc/nginx/sites-available/apply.thegoodflea.com
-sudo ln -sfn /etc/nginx/sites-available/apply.thegoodflea.com /etc/nginx/sites-enabled/apply.thegoodflea.com
-sudo mkdir -p /var/www/vendor-apply/current
-sudo nginx -t && sudo systemctl reload nginx
-```
+The frontend reads the **public** site key at build time from `VITE_TURNSTILE_SITE_KEY`. The site key
+is not secret, but keep it in the repository settings rather than in code:
 
-The site serves the public form build from `/var/www/vendor-apply/current` and proxies only
-`/api/v1/public/` to Django; the staff API and `/admin/` answer 404 on this host.
+1. In the **frontend** GitHub repository: Settings → Secrets and variables → Actions → Variables →
+   New repository variable `VITE_TURNSTILE_SITE_KEY` = the site key.
+2. The build step in `.github/workflows/ci-cd.yml` must pass it (one added line, next to
+   `VITE_API_BASE`):
 
-The ops site file on an existing server is not replaced by the bootstrap script. If
-`/etc/nginx/sites-available/ops.thegoodflea.com` still contains `Proxy_pass … proxy_set_header Host
-$host;` on one line, fix it the same way as `deploy/nginx-ops.thegoodflea.com.conf` (lowercase
-`proxy_pass`, the `proxy_set_header` on its own line), then `sudo nginx -t`.
+   ```yaml
+   - run: npm run build
+     env:
+       VITE_API_BASE: /api/v1
+       VITE_TURNSTILE_SITE_KEY: ${{ vars.VITE_TURNSTILE_SITE_KEY }}
+   ```
 
-### 5. Certificate
+3. Merge to main to rebuild and deploy the frontend.
 
-```sh
-sudo certbot --nginx -d apply.thegoodflea.com
-curl -I https://apply.thegoodflea.com/
-```
+Without the site key the page says the form is unavailable and cannot be submitted (it never
+submits without a token).
 
-Choose the redirect-to-HTTPS option.
-
-### 6. Shared cache table
+### 4. Shared cache table
 
 Throttle counters are kept in a database cache table shared by every gunicorn worker. The deploy
 script runs `createcachetable` after `migrate`; to create it by hand (safe to repeat):
@@ -622,17 +617,40 @@ script runs `createcachetable` after `migrate`; to create it by hand (safe to re
 sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py createcachetable
 ```
 
+### 5. nginx (check once)
+
+The existing site file must proxy `/api/` correctly. If `/etc/nginx/sites-available/ops.thegoodflea.com`
+still contains `Proxy_pass … proxy_set_header Host $host;` on one line, fix it the same way as
+`deploy/nginx-ops.thegoodflea.com.conf` (lowercase `proxy_pass`, `proxy_set_header` on its own line),
+then:
+
+```sh
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Django counts abuse limits by the last address in `X-Forwarded-For`, which nginx adds. Do not put a
+proxy or CDN (for example Cloudflare's orange-cloud proxy) in front of `ops.thegoodflea.com` without
+revisiting `NUM_PROXIES` in the backend settings.
+
+`deploy/nginx-apply.thegoodflea.com.conf` is an optional alternative for a separate
+`apply.thegoodflea.com` host; it is not needed for `/apply`.
+
 ### Switching the form on and off
 
 ```sh
 sudoedit /etc/vendor-ops/backend.env        # PUBLIC_APPLICATIONS_ENABLED=true (or false)
 sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py check
 sudo systemctl restart vendor-ops-backend
-curl -s https://apply.thegoodflea.com/api/v1/public/market-weekends/    # 404 means off
+curl -s https://ops.thegoodflea.com/api/v1/public/market-weekends/    # 404 means off
 ```
 
-`manage.py check` fails (`public_api.E001`) if the form is on without `TURNSTILE_SECRET_KEY`; fix the
-environment before restarting. Turning it off takes effect at the restart; nothing is deleted. Watch
-for `daily cap` warnings in `sudo journalctl -u vendor-ops-backend`: they mean the
-`PUBLIC_APPLICATIONS_DAILY_CAP` was reached and further applications are refused until midnight
-(business time zone).
+Fix any `manage.py check` error before restarting. Turning the form off takes effect at the restart;
+nothing is deleted. Watch `sudo journalctl -u vendor-ops-backend` for `daily cap` warnings (the cap
+was reached; further applications are refused until midnight, business time zone) and
+`Turnstile verification could not run` errors (usually a wrong secret key).
+
+### Safe first check
+
+Before switching the form on for real, try it once with sending still disabled or redirected
+(`EMAIL_GLOBAL_MODE`), submit a test application with your own email address, check that it appears
+on the board with source "Website form", then decline or withdraw it.

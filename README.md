@@ -401,10 +401,11 @@ limitations are in [docs/email-slice-2-testing.md](docs/email-slice-2-testing.md
 
 ## Public application form
 
-The vendor-facing page (apply.thegoodflea.com, also the ads landing page) uses two endpoints under
-`/api/v1/public/`. They need no login, session or CSRF token, and both answer **404 while
-`PUBLIC_APPLICATIONS_ENABLED` is off (the default)**. nginx exposes only this path on the apply host
-(`deploy/nginx-apply.thegoodflea.com.conf`).
+The vendor-facing page (**https://ops.thegoodflea.com/apply**, also the ads landing page; in the
+frontend repository) uses two endpoints under `/api/v1/public/`. They need no login, session or CSRF
+token, and both answer **404 while `PUBLIC_APPLICATIONS_ENABLED` is off (the default)**. The page calls
+nothing else; the staff API still requires a signed-in team member. (A separate
+`apply.thegoodflea.com` host is possible with `deploy/nginx-apply.thegoodflea.com.conf`, but not needed.)
 
 ### `GET /api/v1/public/market-weekends/`
 
@@ -466,8 +467,8 @@ ambiguous) and a filled honeypot get `200 {"status": "received"}`, with no ids o
 
 | Protection | Behaviour |
 | --- | --- |
-| Cloudflare Turnstile | Verified server-side (siteverify) after validation. Fails closed: a failed check answers 400, an unreachable Turnstile or a bad secret 503; nothing is created. The client IP is sent as `remoteip` only when it is a valid address. |
-| Secret required | `manage.py check` errors (`public_api.E001`) when the form is on and `DJANGO_DEBUG` is false without `TURNSTILE_SECRET_KEY`; such a server answers 503. With DEBUG on and no secret, verification is skipped (local development only). |
+| Cloudflare Turnstile | Verified server-side (siteverify) after validation and before anything is created. The token must be a success **for an expected hostname** (`TURNSTILE_EXPECTED_HOSTNAMES`, default `ops.thegoodflea.com`) **and the expected action** (`TURNSTILE_EXPECTED_ACTION`, default `apply`). Missing, invalid, expired, reused or mismatched tokens answer 400; an unreachable Turnstile or a bad secret 503. Fails closed: nothing is created. The client IP is sent as `remoteip` only when it is a valid address. |
+| No bypass | Without `TURNSTILE_SECRET_KEY` every submission is refused (503), in development too. `manage.py check` errors when the form is on in production without the secret (`public_api.E001`), the expected hostnames (`E002`) or the expected action (`E003`), and warns for a Cloudflare test secret (`W001`). |
 | Per-IP throttle | `public_apply` 10/hour (mobile networks share addresses; do not go lower). |
 | Per-email limit | 3 accepted submissions per address per day (429); the cache key is a keyed hash, never the address. Refused or invalid attempts do not count. |
 | Daily cap | `PUBLIC_APPLICATIONS_DAILY_CAP` (200) website applications created per day in the business time zone; above it 503 and a warning in the log. Bundled submissions create no application and are not counted. |
@@ -487,7 +488,9 @@ Cloudflare's documented test keys work without an account: site key `1x000000000
 (always passes) or `2x00000000000000000000AB` (always fails) in the page, and secret
 `1x0000000000000000000000000000000AA` (always passes), `2x0000000000000000000000000000000AA` (always
 fails) or `3x0000000000000000000000000000000AA` (token already spent) here. The test site keys
-produce the token `XXXX.DUMMY.TOKEN.XXXX`, which only test secrets accept.
+produce the token `XXXX.DUMMY.TOKEN.XXXX`, which only test secrets accept. Test-key responses carry
+placeholder hostnames and actions, so with `DJANGO_DEBUG=true` **and a test secret** the hostname and
+action checks are skipped; a real secret is always checked in full, and production never relaxes them.
 
 ```sh
 # .env: PUBLIC_APPLICATIONS_ENABLED=true, TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
@@ -496,7 +499,7 @@ curl -s -X POST localhost:8000/api/v1/public/applications/ -H 'Content-Type: app
   -d '{"first_name":"Ana","last_name":"Silva","email":"ana@example.com","phone":"5551234567","brand_name":"Juniper","instagram":"juniper","weekend_ids":["<id>"],"booth_size":"not_sure","consent":true,"turnstile_token":"XXXX.DUMMY.TOKEN.XXXX"}'
 ```
 
-Automated tests mock Turnstile and never call Cloudflare.
+Automated tests use only these test keys, mock siteverify and never call Cloudflare.
 
 ### Staff side
 
