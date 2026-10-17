@@ -276,6 +276,10 @@ class ApplicationStatusChangeSerializer(serializers.Serializer):
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
 
 
+class LinesFromRequestsSerializer(serializers.Serializer):
+    booth_size = serializers.CharField(max_length=100, help_text="A booth variant name, e.g. '8ft x 8ft'.")
+
+
 class ApplicationStageChangeSerializer(serializers.Serializer):
     stage = serializers.ChoiceField(choices=Application.Stage.choices)
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)

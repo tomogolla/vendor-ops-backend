@@ -236,6 +236,36 @@ def _lock(line: ApplicationLine) -> ApplicationLine:
 
 
 @transaction.atomic
+@transaction.atomic
+def lines_from_requests(application: Application, *, booth_size: str, actor) -> dict:
+    """A team convenience for web applications: for each requested weekend without an open booth
+    line, request that weekend's booth of `booth_size`. Weekends are skipped, with a reason, when the
+    application already has an open line there, the size is not offered or the weekend is closed."""
+    application = Application.objects.select_for_update(of=('self',)).select_related('vendor').get(pk=application.pk)
+    if application.stage not in LINE_EDIT_STAGES:
+        raise ValidationError({'application': 'Lines can be added only while the application is New, In review or Won.'})
+    created, skipped = [], []
+    for weekend in application.requested_weekends.order_by('start_date', 'label'):
+        ref = {'id': str(weekend.pk), 'label': weekend.label}
+        has_open_line = application.lines.filter(variant__weekend=weekend, status__in=ApplicationLine.OPEN_STATUSES).exists()
+        variant = BoothVariant.objects.filter(weekend=weekend, name=booth_size).first()
+        if has_open_line:
+            skipped.append({'weekend': ref, 'reason': 'already has an open booth line'})
+        elif variant is None:
+            skipped.append({'weekend': ref, 'reason': f'{booth_size} is not offered that weekend'})
+        elif weekend.status == MarketWeekend.Status.CLOSED:
+            skipped.append({'weekend': ref, 'reason': 'the weekend is closed'})
+        else:
+            created.append(add_line(application, actor=actor, variant=variant))
+    record_activity(
+        application.vendor, Event.LINES_FROM_REQUESTS,
+        f'{len(created)} line{"" if len(created) == 1 else "s"} of {booth_size} created from requested weekends',
+        actor=actor, application=application, booth_size=booth_size,
+        line_ids=[str(line.pk) for line in created], skipped=skipped,
+    )
+    return {'created': created, 'skipped': skipped}
+
+
 def add_line(
     application: Application, *, actor, variant: BoothVariant | None = None, add_on: AddOn | None = None,
     parent_line: ApplicationLine | None = None, quantity: int = 1,

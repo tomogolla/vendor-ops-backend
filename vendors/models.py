@@ -436,6 +436,7 @@ class ActivityEvent(models.Model):
         EMAIL_COMPLAINED = 'EMAIL_COMPLAINED', 'Email marked as spam'
         EMAIL_REVISED = 'EMAIL_REVISED', 'Email draft edited'
         NOTE_ADDED = 'NOTE_ADDED', 'Note added'
+        LINES_FROM_REQUESTS = 'LINES_FROM_REQUESTS', 'Lines created from requested weekends'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name='activity')

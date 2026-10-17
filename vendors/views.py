@@ -24,6 +24,7 @@ from .serializers import (
     DiscountSerializer,
     InternalNoteSerializer,
     LineDecisionSerializer,
+    LinesFromRequestsSerializer,
     PaymentNoteSerializer,
     QualificationChangeSerializer,
     VendorSerializer,
@@ -277,6 +278,16 @@ class ApplicationViewSet(
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)
+
+    @action(detail=True, methods=['post'], url_path='lines-from-requests')
+    def lines_from_requests(self, request, pk=None):
+        """Any team member: request a booth size on every requested weekend that has no open line."""
+        application = self.get_object()
+        serializer = LinesFromRequestsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = pipeline.lines_from_requests(application, booth_size=serializer.validated_data['booth_size'], actor=request.user)
+        lines = LINES_QUERYSET.filter(pk__in=[line.pk for line in result['created']])
+        return Response({'created': ApplicationLineSerializer(lines, many=True).data, 'skipped': result['skipped']})
 
     @action(detail=True, methods=['get', 'post'])
     def lines(self, request, pk=None):
