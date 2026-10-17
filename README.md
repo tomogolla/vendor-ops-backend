@@ -10,6 +10,7 @@ python -m venv .venv
 pip install -r requirements.txt
 copy .env.example .env            # then edit DATABASE_URL and DJANGO_SECRET_KEY
 python manage.py migrate
+python manage.py createcachetable  # shared cache for throttles (idempotent)
 python manage.py seed_dev         # demo users, weekends and vendors, DEBUG only
 python manage.py runserver 8000
 python manage.py test
@@ -17,7 +18,8 @@ python manage.py test
 
 Apps: `accounts` (users and roles), `communications` (email; see "Email" below), `catalog` (market weekends, booth variants, add-ons),
 `vendors` (vendors, applications and their lines, intake events, notes, activity timeline),
-`tasks` (tasks, business-hours scheduling, call logging), `imports` (CSV).
+`tasks` (tasks, business-hours scheduling, call logging), `imports` (CSV), `public_api` (the public
+application form; see "Public application form" below).
 Business rules live in services (`vendors/services.py`, `vendors/pipeline.py`,
 `catalog/services.py`, `tasks/services.py`, `imports/services.py`); views stay thin. Every state
 change writes an append-only `ActivityEvent`.
@@ -113,10 +115,11 @@ stage is SUSPENDED, `inactive` if not active, `active` if any application is WON
 | `market-weekends/` (GET, POST, PATCH, DELETE) | read: all; write: admins | detail includes per-product capacity, confirmed, remaining, waitlisted and promotion suggestions |
 | `market-weekends/{id}/variants/`, `.../variants/{id}/` | read: all; write: admins | |
 | `market-weekends/{id}/add-ons/`, `.../add-ons/{id}/` | read: all; write: admins | |
-| `applications/` (GET, POST, PATCH) | all; discounts and reviewer: admins | filters: `stage` (comma-separated), `has_waitlisted_lines`, `call=none\|attempted_not_reached`, `owner=me\|none\|<id>` (vendor owner), `source`, `weekend`, `vendor`, `reviewer` |
+| `applications/` (GET, POST, PATCH) | all; discounts and reviewer: admins | filters: `stage` (comma-separated), `has_waitlisted_lines`, `call=none\|attempted_not_reached`, `owner=me\|none\|<id>` (vendor owner), `source`, `weekend`, `vendor`, `reviewer`, `campaign` (utm_campaign of the vendor's latest intake event). Items include `requested_weekends` [{id, label}] and `campaign` |
 | `applications/summary/` | all | counts per stage and the 10 oldest AWAITING_PAYMENT |
 | `applications/{id}/stage/` (POST) | admins | `{stage, reason}` |
 | `applications/{id}/lines/` (GET, POST) | all | |
+| `applications/{id}/lines-from-requests/` (POST) | all | `{booth_size}`: one REQUESTED line per requested weekend that has no open booth line; returns `created` and `skipped` (with reasons) |
 | `applications/{id}/emails/` (GET, POST) | all | the application's emails; POST `{template_key, application_line?}` prepares a draft (see *Application emails*) |
 | `applications/{id}/mark-billed/`, `mark-first-payment/` (POST) | admins | placeholders |
 | `application-lines/{id}/` (GET, PATCH, DELETE) | all | PATCH (quantity) and DELETE only while REQUESTED |
@@ -394,3 +397,110 @@ Buckets: `awaiting_review` (draft), `queued` (queued, sending), `sent` (sent, de
 (the stop-condition reason, or null). Full example responses and UI states are in
 [docs/email-frontend-guide.md](docs/email-frontend-guide.md); the manual testing checklist and known
 limitations are in [docs/email-slice-2-testing.md](docs/email-slice-2-testing.md).
+
+
+## Public application form
+
+The vendor-facing page (apply.thegoodflea.com, also the ads landing page) uses two endpoints under
+`/api/v1/public/`. They need no login, session or CSRF token, and both answer **404 while
+`PUBLIC_APPLICATIONS_ENABLED` is off (the default)**. nginx exposes only this path on the apply host
+(`deploy/nginx-apply.thegoodflea.com.conf`).
+
+### `GET /api/v1/public/market-weekends/`
+
+OPEN weekends that are not over yet, soonest first. Never prices, capacities, counts or vendor data.
+`Cache-Control: public, max-age=60`; throttle `public_weekends` (120/hour per client IP).
+
+```json
+{
+  "weekends": [
+    {"id": "…", "label": "Oct 10 & 11", "start_date": "2026-10-10", "end_date": "2026-10-11",
+     "variants": [{"name": "8ft x 8ft", "dimensions": "", "waitlist": true}, {"name": "10ft x 10ft", "dimensions": "", "waitlist": false}],
+     "waitlist_only": false}
+  ],
+  "booth_sizes": [{"name": "8ft x 8ft", "dimensions": ""}, {"name": "10ft x 10ft", "dimensions": ""}]
+}
+```
+
+`waitlist` is true when a size has no spot left; `waitlist_only` when every size is on the waitlist.
+Applying is still allowed: requested lines never use capacity, and staff waitlist them at review.
+
+### `POST /api/v1/public/applications/`
+
+```json
+{"first_name": "Ana", "last_name": "Silva", "email": "ana@example.com", "phone": "555 123 4567",
+ "brand_name": "Juniper Goods", "instagram": "@juniper.goods", "weekend_ids": ["…"],
+ "booth_size": "8ft x 8ft", "consent": true, "consent_text_version": "2026-10",
+ "turnstile_token": "…", "website": "",
+ "attribution": {"utm_source": "meta", "utm_medium": "paid", "utm_campaign": "fall-ads", "utm_content": "",
+                 "utm_term": "", "fbclid": "", "gclid": "", "referrer": "", "landing_path": "/"}}
+```
+
+**Validation** (400 with per-field errors, only about the applicant's own input): first name, last
+name and brand name required; a valid email; phone with 7 to 15 digits after normalising; Instagram as
+`@handle` or an instagram.com link, normalised to letters, digits, dots and underscores (1 to 30);
+1 to 12 distinct weekends, all open; `booth_size` is `not_sure` or a size offered on at least one
+chosen weekend; `consent` true. Control characters are stripped and lengths capped.
+
+**What it does**: exactly what a staff-entered application does, through `submit_application`, as
+the inactive "Website form" system user, with source `Website form`:
+
+- a chosen size becomes one REQUESTED line per chosen weekend that offers it (a weekend without that
+  size is a requested weekend only); `not_sure` creates no lines;
+- `requested_weekends` always holds every chosen weekend;
+- a new application starts at New with a call task and the `application_received` email trigger
+  (subject to the template's mode, Off by default); a vendor with an open application is
+  **bundled** into it (booths it already has are skipped, not refused);
+- attribution, a truncated user agent, the consent (version and time) and the details the applicant
+  typed go in the intake event's metadata. **The IP address is never stored.**
+- **Several matching vendors** (e.g. the email matches one and the phone another): never dropped and
+  never revealed. It is attached to the email match (else phone, else Instagram), with a staff note
+  ("Phone also matches <brand>") and a team-queue follow-up task "Possible duplicate vendor: review
+  web application".
+
+**The same answer for everyone**: every accepted submission (new vendor, existing vendor, bundled,
+ambiguous) and a filled honeypot get `200 {"status": "received"}`, with no ids or flags. A filled
+`website` (honeypot) field creates nothing. Everything is one transaction.
+
+### Spam and abuse protection
+
+| Protection | Behaviour |
+| --- | --- |
+| Cloudflare Turnstile | Verified server-side (siteverify) after validation. Fails closed: a failed check answers 400, an unreachable Turnstile or a bad secret 503; nothing is created. The client IP is sent as `remoteip` only when it is a valid address. |
+| Secret required | `manage.py check` errors (`public_api.E001`) when the form is on and `DJANGO_DEBUG` is false without `TURNSTILE_SECRET_KEY`; such a server answers 503. With DEBUG on and no secret, verification is skipped (local development only). |
+| Per-IP throttle | `public_apply` 10/hour (mobile networks share addresses; do not go lower). |
+| Per-email limit | 3 accepted submissions per address per day (429); the cache key is a keyed hash, never the address. Refused or invalid attempts do not count. |
+| Daily cap | `PUBLIC_APPLICATIONS_DAILY_CAP` (200) website applications created per day in the business time zone; above it 503 and a warning in the log. Bundled submissions create no application and are not counted. |
+| Kill switch | `PUBLIC_APPLICATIONS_ENABLED=false` (default): both endpoints 404. |
+| Logs | Never request bodies, tokens or personal details; the application id only. |
+
+**Client IP and the cache.** gunicorn listens on a unix socket behind nginx, which appends the real
+client address to `X-Forwarded-For`. `REST_FRAMEWORK['NUM_PROXIES'] = 1` makes throttles use that
+last entry, so a client-sent prefix cannot change who is counted (tested). Throttle counters live in
+a shared database cache table (`django_cache`) rather than per-process memory, so every gunicorn
+worker counts together; `manage.py createcachetable` creates it (the deploy script runs it after
+`migrate`). Tests use an in-memory cache.
+
+### Testing locally with Turnstile test keys
+
+Cloudflare's documented test keys work without an account: site key `1x00000000000000000000AA`
+(always passes) or `2x00000000000000000000AB` (always fails) in the page, and secret
+`1x0000000000000000000000000000000AA` (always passes), `2x0000000000000000000000000000000AA` (always
+fails) or `3x0000000000000000000000000000000AA` (token already spent) here. The test site keys
+produce the token `XXXX.DUMMY.TOKEN.XXXX`, which only test secrets accept.
+
+```sh
+# .env: PUBLIC_APPLICATIONS_ENABLED=true, TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+curl -s localhost:8000/api/v1/public/market-weekends/
+curl -s -X POST localhost:8000/api/v1/public/applications/ -H 'Content-Type: application/json' \
+  -d '{"first_name":"Ana","last_name":"Silva","email":"ana@example.com","phone":"5551234567","brand_name":"Juniper","instagram":"juniper","weekend_ids":["<id>"],"booth_size":"not_sure","consent":true,"turnstile_token":"XXXX.DUMMY.TOKEN.XXXX"}'
+```
+
+Automated tests mock Turnstile and never call Cloudflare.
+
+### Staff side
+
+Web applications appear on the board with source `Website form`, `requested_weekends` and
+`campaign`. `POST /applications/{id}/lines-from-requests/ {"booth_size": "8ft x 8ft"}` (any team
+member) requests that size on every requested weekend that has no open booth line and says which
+weekends it skipped and why.

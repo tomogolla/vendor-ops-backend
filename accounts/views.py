@@ -57,12 +57,12 @@ class TeamView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        users = User.objects.filter(is_active=True)
+        users = User.objects.filter(is_active=True, is_system=False)
         return Response(UserSummarySerializer(users, many=True).data)
 
 
 class UserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.all()
+    queryset = User.objects.filter(is_system=False)  # system accounts are not managed here
     serializer_class = UserAdminSerializer
     permission_classes = [IsAdministrator]
     http_method_names = ['get', 'post', 'patch', 'head', 'options']

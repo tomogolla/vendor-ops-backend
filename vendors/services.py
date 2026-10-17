@@ -14,7 +14,7 @@ from tasks.services import already_reached, ensure_application_review, ensure_di
 
 from . import pipeline
 from .activity import record_activity
-from .models import ActivityEvent, Application, InternalNote, LeadIntakeEvent, Vendor
+from .models import ActivityEvent, Application, ApplicationLine, InternalNote, LeadIntakeEvent, Vendor
 from .normalization import normalize_email, normalize_instagram, normalize_phone
 from .pipeline import change_application_stage, sync_application_summary
 
@@ -130,7 +130,7 @@ class Intake:
 def submit_application(
     *, actor, vendor: Vendor | None = None, vendor_data: dict | None = None,
     application_data: dict | None = None, source='Staff entry', lines: list[dict] | None = None,
-    notes: str = '', intake: Intake | None = None, create_call: bool = True,
+    notes: str = '', intake: Intake | None = None, create_call: bool = True, skip_duplicate_lines: bool = False,
 ) -> Application:
     """Every entry path comes through here.
 
@@ -142,6 +142,9 @@ def submit_application(
     `lines` items look like {'variant': BoothVariant, 'quantity': 1, 'add_ons': [{'add_on': AddOn,
     'quantity': 1}]}. The returned application carries two transient flags: `bundled` and
     `call_created`.
+
+    `skip_duplicate_lines` (public submissions): a booth the open application already has an open
+    line for is skipped instead of refused, so a repeat applicant's submission is never lost.
     """
     vendor_data = vendor_data or {}
     application_data = application_data or {}
@@ -174,7 +177,7 @@ def submit_application(
         .order_by('submitted_at').first()
     )
     if open_application:
-        added = _add_submitted_lines(open_application, lines, actor)
+        added, skipped = _add_submitted_lines(open_application, lines, actor, skip_duplicates=skip_duplicate_lines)
         if notes:
             add_note(vendor, actor=actor, body=notes, note_type=InternalNote.NoteType.APPLICATION_REVIEW,
                      application=open_application)
@@ -182,6 +185,7 @@ def submit_application(
             vendor, Event.APPLICATION_BUNDLED, f'Submission ({source}) added to the open application',
             actor=actor, application=open_application, source=source, created_vendor=created_vendor,
             line_ids=[str(line.pk) for line in added], submitted_data=_jsonable(application_data),
+            **({'skipped_existing_variant_ids': skipped} if skipped else {}),
         )
         open_application.bundled, open_application.call_created = True, False
         return open_application
@@ -212,7 +216,7 @@ def submit_application(
             # A call opened before v1.3 (or before this application) now belongs to it.
             call.application = application
             call.save(update_fields=['application', 'updated_at'])
-    _add_submitted_lines(application, lines, actor)
+    _add_submitted_lines(application, lines, actor, skip_duplicates=skip_duplicate_lines)
     if notes:
         add_note(vendor, actor=actor, body=notes, note_type=InternalNote.NoteType.APPLICATION_REVIEW,
                  application=application)
@@ -222,16 +226,22 @@ def submit_application(
     return application
 
 
-def _add_submitted_lines(application: Application, lines: list[dict] | None, actor) -> list:
-    added = []
+def _add_submitted_lines(application: Application, lines: list[dict] | None, actor, skip_duplicates=False) -> tuple[list, list]:
+    """Returns the added lines and the ids of variants skipped because an open line exists."""
+    added, skipped = [], []
     for item in lines or []:
+        if skip_duplicates and application.lines.filter(
+            variant=item['variant'], status__in=ApplicationLine.OPEN_STATUSES,
+        ).exists():
+            skipped.append(str(item['variant'].pk))
+            continue
         booth = pipeline.add_line(application, actor=actor, variant=item['variant'], quantity=item.get('quantity', 1))
         added.append(booth)
         for extra in item.get('add_ons', []):
             added.append(pipeline.add_line(
                 application, actor=actor, add_on=extra['add_on'], parent_line=booth, quantity=extra.get('quantity', 1),
             ))
-    return added
+    return added, skipped
 
 
 def _jsonable(data: dict) -> dict:

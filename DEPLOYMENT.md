@@ -537,3 +537,102 @@ Recheck only the `DATABASE_URL` in `/etc/vendor-ops/backend.env`. Confirm the da
 ### Certbot says a certificate already exists
 
 This is expected after a previous installation. Select the option to reinstall the existing certificate unless it is expired or covers a different domain.
+
+
+## Public application form (apply.thegoodflea.com)
+
+The public form is **off** until you switch it on (`PUBLIC_APPLICATIONS_ENABLED=false` by default:
+its endpoints answer 404). These steps add the site; do them once, in order. See the backend README,
+"Public application form", for what the form does and how it is protected.
+
+### 1. DNS record (in Shopify)
+
+`thegoodflea.com` DNS is managed in Shopify (Settings → Domains → thegoodflea.com → DNS settings).
+Add:
+
+| Type | Host/name | Value |
+|---|---|---|
+| A | `apply` | The droplet’s public IPv4 address (the same as `ops`) |
+
+Check from your computer before continuing:
+
+```sh
+nslookup apply.thegoodflea.com
+```
+
+Do not put a proxy or CDN in front of this name (for example Cloudflare’s orange-cloud proxy): Django
+counts abuse limits by the last address in `X-Forwarded-For`, which must be the one nginx adds.
+
+### 2. Cloudflare Turnstile
+
+In the Cloudflare dashboard (a free account is enough), open Turnstile, add a widget for the hostname
+`apply.thegoodflea.com`, and copy the **site key** (it goes into the frontend build) and the **secret
+key** (it goes only into the server environment below). Never commit the secret key.
+
+### 3. Server environment
+
+```sh
+sudoedit /etc/vendor-ops/backend.env
+```
+
+Add the host and the form settings (keep everything else):
+
+```dotenv
+DJANGO_ALLOWED_HOSTS=ops.thegoodflea.com,apply.thegoodflea.com,127.0.0.1,localhost
+TURNSTILE_SECRET_KEY=the-secret-key-from-cloudflare
+PUBLIC_APPLICATIONS_DAILY_CAP=200
+PUBLIC_APPLICATIONS_ENABLED=false
+```
+
+`CSRF_TRUSTED_ORIGINS` does not need the apply host: the public endpoints use no session or CSRF
+cookie, and the page calls them on its own host. CORS is not needed for the same reason.
+
+### 4. nginx site
+
+```sh
+sudo install -m 0644 /opt/vendor-ops/backend-current/deploy/nginx-apply.thegoodflea.com.conf /etc/nginx/sites-available/apply.thegoodflea.com
+sudo ln -sfn /etc/nginx/sites-available/apply.thegoodflea.com /etc/nginx/sites-enabled/apply.thegoodflea.com
+sudo mkdir -p /var/www/vendor-apply/current
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The site serves the public form build from `/var/www/vendor-apply/current` and proxies only
+`/api/v1/public/` to Django; the staff API and `/admin/` answer 404 on this host.
+
+The ops site file on an existing server is not replaced by the bootstrap script. If
+`/etc/nginx/sites-available/ops.thegoodflea.com` still contains `Proxy_pass … proxy_set_header Host
+$host;` on one line, fix it the same way as `deploy/nginx-ops.thegoodflea.com.conf` (lowercase
+`proxy_pass`, the `proxy_set_header` on its own line), then `sudo nginx -t`.
+
+### 5. Certificate
+
+```sh
+sudo certbot --nginx -d apply.thegoodflea.com
+curl -I https://apply.thegoodflea.com/
+```
+
+Choose the redirect-to-HTTPS option.
+
+### 6. Shared cache table
+
+Throttle counters are kept in a database cache table shared by every gunicorn worker. The deploy
+script runs `createcachetable` after `migrate`; to create it by hand (safe to repeat):
+
+```sh
+sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py createcachetable
+```
+
+### Switching the form on and off
+
+```sh
+sudoedit /etc/vendor-ops/backend.env        # PUBLIC_APPLICATIONS_ENABLED=true (or false)
+sudo -u vendorops /opt/vendor-ops/venv/bin/python /opt/vendor-ops/backend-current/manage.py check
+sudo systemctl restart vendor-ops-backend
+curl -s https://apply.thegoodflea.com/api/v1/public/market-weekends/    # 404 means off
+```
+
+`manage.py check` fails (`public_api.E001`) if the form is on without `TURNSTILE_SECRET_KEY`; fix the
+environment before restarting. Turning it off takes effect at the restart; nothing is deleted. Watch
+for `daily cap` warnings in `sudo journalctl -u vendor-ops-backend`: they mean the
+`PUBLIC_APPLICATIONS_DAILY_CAP` was reached and further applications are refused until midnight
+(business time zone).

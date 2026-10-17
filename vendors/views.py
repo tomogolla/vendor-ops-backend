@@ -13,7 +13,7 @@ from tasks.models import Task
 
 from . import pipeline, services
 from .filters import ApplicationFilter, VendorFilter
-from .models import Application, ApplicationLine, Vendor, vendor_label_expression
+from .models import Application, ApplicationLine, Vendor, campaign_expression, vendor_label_expression
 from .serializers import (
     VENDOR_EDITABLE_FIELDS,
     ActivityEventSerializer,
@@ -24,6 +24,7 @@ from .serializers import (
     DiscountSerializer,
     InternalNoteSerializer,
     LineDecisionSerializer,
+    LinesFromRequestsSerializer,
     PaymentNoteSerializer,
     QualificationChangeSerializer,
     VendorSerializer,
@@ -168,8 +169,9 @@ class ApplicationViewSet(
         calls = Task.objects.filter(application=OuterRef('pk'), task_type=Task.TaskType.DISCOVERY_CALL)
         open_tasks = Task.objects.filter(application=OuterRef('pk'), status__in=Task.OPEN_STATUSES, due_at__isnull=False)
         return Application.objects.select_related('vendor', 'reviewer', 'submitted_by').prefetch_related(
-            Prefetch('lines', queryset=LINES_QUERYSET),
+            Prefetch('lines', queryset=LINES_QUERYSET), 'requested_weekends',
         ).annotate(
+            campaign=campaign_expression(),
             call_exhausted=Exists(pipeline.exhausted_calls().filter(application=OuterRef('pk'))),
             call_attempts=Coalesce(
                 Subquery(calls.values('application').annotate(total=Sum('attempt_count')).values('total')), 0,
@@ -276,6 +278,16 @@ class ApplicationViewSet(
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(self.get_serializer(self.get_queryset().get(pk=application.pk)).data)
+
+    @action(detail=True, methods=['post'], url_path='lines-from-requests')
+    def lines_from_requests(self, request, pk=None):
+        """Any team member: request a booth size on every requested weekend that has no open line."""
+        application = self.get_object()
+        serializer = LinesFromRequestsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = pipeline.lines_from_requests(application, booth_size=serializer.validated_data['booth_size'], actor=request.user)
+        lines = LINES_QUERYSET.filter(pk__in=[line.pk for line in result['created']])
+        return Response({'created': ApplicationLineSerializer(lines, many=True).data, 'skipped': result['skipped']})
 
     @action(detail=True, methods=['get', 'post'])
     def lines(self, request, pk=None):

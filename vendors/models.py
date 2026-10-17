@@ -2,7 +2,9 @@ import uuid
 
 from django.conf import settings
 from django.db import models
-from django.db.models import Q
+from django.db.models import OuterRef, Q, Subquery, Value
+from django.db.models.fields.json import KT
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from .normalization import normalize_email, normalize_instagram, normalize_phone
@@ -155,6 +157,13 @@ class Vendor(models.Model):
         return 'lead'
 
 
+def campaign_expression(vendor_ref='vendor'):
+    """utm_campaign of the vendor's most recent intake event, or '' (attribution is recorded per
+    intake event, i.e. per submission, on the vendor)."""
+    latest = LeadIntakeEvent.objects.filter(vendor=OuterRef(vendor_ref)).order_by('-captured_at')
+    return Coalesce(Subquery(latest.annotate(campaign=KT('metadata__utm_campaign')).values('campaign')[:1]), Value(''), output_field=models.TextField())
+
+
 class LeadIntakeEvent(models.Model):
     """How a vendor entered (or re-entered) the system."""
 
@@ -258,6 +267,12 @@ class Application(models.Model):
     preferred_market_dates = models.JSONField(default=list, blank=True)
     required_support = models.TextField(blank=True)
     responses = models.JSONField(default=dict, blank=True, help_text='Flexible structured answers.')
+    # What the applicant asked for, even when order lines were also created (or could not be, e.g.
+    # the booth size is not offered that weekend or they chose "not sure yet").
+    requested_weekends = models.ManyToManyField(
+        'catalog.MarketWeekend', blank=True, related_name='requesting_applications',
+        help_text='Market weekends the applicant asked for.',
+    )
 
     decision = models.CharField(max_length=20, blank=True, choices=Status.choices)
     decision_reason = models.TextField(blank=True)
@@ -421,6 +436,7 @@ class ActivityEvent(models.Model):
         EMAIL_COMPLAINED = 'EMAIL_COMPLAINED', 'Email marked as spam'
         EMAIL_REVISED = 'EMAIL_REVISED', 'Email draft edited'
         NOTE_ADDED = 'NOTE_ADDED', 'Note added'
+        LINES_FROM_REQUESTS = 'LINES_FROM_REQUESTS', 'Lines created from requested weekends'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     vendor = models.ForeignKey(Vendor, on_delete=models.PROTECT, related_name='activity')

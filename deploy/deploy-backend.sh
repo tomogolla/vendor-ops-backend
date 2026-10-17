@@ -41,6 +41,8 @@ if systemctl list-unit-files "${EMAIL_TIMER}" >/dev/null 2>&1 && systemctl is-en
 fi
 
 sudo -u vendorops "${VENV}/bin/python" "${RELEASE_DIR}/manage.py" migrate --noinput
+# Shared cache table for throttles (idempotent: does nothing when it exists).
+sudo -u vendorops "${VENV}/bin/python" "${RELEASE_DIR}/manage.py" createcachetable
 sudo -u vendorops "${VENV}/bin/python" "${RELEASE_DIR}/manage.py" collectstatic --noinput
 
 ln -sfn "${RELEASE_DIR}" "${CURRENT_LINK}"

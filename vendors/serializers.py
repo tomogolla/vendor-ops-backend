@@ -196,6 +196,8 @@ class ApplicationSerializer(serializers.ModelSerializer):
     has_waitlisted_lines = serializers.SerializerMethodField()
     call_attempts = serializers.SerializerMethodField()
     next_task_due_at = serializers.SerializerMethodField()
+    requested_weekends = serializers.SerializerMethodField(help_text='Weekends the applicant asked for: [{id, label}].')
+    campaign = serializers.SerializerMethodField(help_text="utm_campaign of the vendor's latest intake event, or blank.")
 
     class Meta:
         model = Application
@@ -206,7 +208,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
             'reviewer', 'category', 'product_description', 'social_snapshot', 'previous_market_experience',
             'booth_requirements', 'preferred_market_dates', 'required_support', 'responses',
             'lines', 'discount_type', 'discount_value', 'discount_label', 'billed_at', 'first_paid_at',
-            'decision', 'decision_reason', 'decided_at', 'updated_at',
+            'decision', 'decision_reason', 'decided_at', 'updated_at', 'requested_weekends', 'campaign',
         ]
         read_only_fields = [
             'id', 'submitted_by', 'submitted_at', 'social_snapshot', 'stage', 'stage_entered_at', 'legacy_status',
@@ -243,6 +245,16 @@ class ApplicationSerializer(serializers.ModelSerializer):
         task = application.tasks.filter(status__in=Task.OPEN_STATUSES, due_at__isnull=False).order_by('due_at').first()
         return task.due_at if task else None
 
+    def get_requested_weekends(self, application) -> list[dict]:
+        return [{'id': str(weekend.pk), 'label': weekend.label} for weekend in application.requested_weekends.all()]
+
+    def get_campaign(self, application) -> str:
+        annotated = getattr(application, 'campaign', None)
+        if annotated is not None:
+            return annotated
+        latest = application.vendor.intake_events.order_by('-captured_at').first()
+        return str((latest.metadata or {}).get('utm_campaign') or '') if latest else ''
+
     def to_representation(self, application):
         """Adds currency, requested_total_cents, confirmed_subtotal_cents, discount_cents and
         confirmed_total_cents, computed from the (prefetched) lines."""
@@ -262,6 +274,10 @@ class ApplicationStatusChangeSerializer(serializers.Serializer):
     """DEPRECATED (v1.3): PATCH /applications/{id}/ with `status`; use the stage endpoint."""
     status = serializers.ChoiceField(choices=Application.Status.choices)
     reason = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
+class LinesFromRequestsSerializer(serializers.Serializer):
+    booth_size = serializers.CharField(max_length=100, help_text="A booth variant name, e.g. '8ft x 8ft'.")
 
 
 class ApplicationStageChangeSerializer(serializers.Serializer):

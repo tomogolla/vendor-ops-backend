@@ -3,7 +3,7 @@ from django.db.models import Exists, OuterRef, Q
 
 from tasks.models import Task
 
-from .models import Application, ApplicationLine, Vendor
+from .models import Application, ApplicationLine, Vendor, campaign_expression
 
 Stage = Vendor.JourneyStage
 AppStatus = Application.Status
@@ -91,6 +91,7 @@ class ApplicationFilter(django_filters.FilterSet):
     reviewer = django_filters.CharFilter(method='filter_reviewer')
     submitted_after = django_filters.IsoDateTimeFilter(field_name='submitted_at', lookup_expr='gte')
     submitted_before = django_filters.IsoDateTimeFilter(field_name='submitted_at', lookup_expr='lt')
+    campaign = django_filters.CharFilter(method='filter_campaign', help_text="utm_campaign of the vendor's latest intake event.")
 
     class Meta:
         model = Application
@@ -120,6 +121,9 @@ class ApplicationFilter(django_filters.FilterSet):
             Q(variant__weekend=value) | Q(add_on__weekend=value), application=OuterRef('pk'),
         )
         return queryset.filter(Exists(on_weekend))
+
+    def filter_campaign(self, queryset, name, value):
+        return queryset.annotate(campaign_filter=campaign_expression()).filter(campaign_filter__iexact=value.strip())
 
     def filter_reviewer(self, queryset, name, value):
         return filter_owner(queryset, 'reviewer', value, self.request)

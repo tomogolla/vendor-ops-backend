@@ -6,3 +6,4 @@ django-environ>=0.14
 psycopg[binary]>=3.3
 gunicorn>=26
 django-anymail[resend]>=15.2,<16
+requests>=2.32,<3
