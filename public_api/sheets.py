@@ -5,6 +5,8 @@ import secrets
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework import serializers, status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -33,6 +35,8 @@ class CleanField(serializers.CharField):
 class GoogleSheetsApplicationSerializer(serializers.Serializer):
     submission_id = CleanField(max_length=500)
     sheet_type = serializers.ChoiceField(choices=SOURCES)
+    sheet_name = CleanField(max_length=200, required=False, allow_blank=True, default='')
+    row_number = serializers.IntegerField(required=False, allow_null=True, min_value=1, default=None)
     first_name = CleanField(max_length=100, required=False, allow_blank=True, default='')
     business_name = CleanField(max_length=200, required=False, allow_blank=True, default='')
     brand_name = CleanField(max_length=200, required=False, allow_blank=True, default='')
@@ -42,9 +46,10 @@ class GoogleSheetsApplicationSerializer(serializers.Serializer):
     form_number = CleanField(max_length=100, required=False, allow_blank=True, default='')
     date_applied = CleanField(max_length=100, required=False, allow_blank=True, default='')
     submission_date = CleanField(max_length=100, required=False, allow_blank=True, default='')
+    raw_fields = serializers.DictField(required=False, default=dict)
 
     def validate(self, attrs):
-        name = attrs['business_name'] if attrs['sheet_type'] == 'vendor_interest_form' else attrs['brand_name']
+        name = attrs['business_name'] or attrs['brand_name']
         if not name:
             raise serializers.ValidationError({'brand_name': 'A business or brand name is required.'})
         if not any(attrs[field] for field in ('email', 'phone_number', 'instagram')):
@@ -71,6 +76,7 @@ def _submit(data):
     }
     metadata = {
         'google_sheets_submission_id': data['submission_id'], 'sheet_type': data['sheet_type'],
+        'sheet_name': data['sheet_name'], 'row_number': data['row_number'], 'raw_fields': data['raw_fields'],
         'form_number': data['form_number'], 'date_applied': data['date_applied'],
         'submission_date': data['submission_date'],
         'submitted_contact': {key: vendor_data[key] for key in ('first_name', 'email', 'phone', 'brand_name', 'instagram')},
@@ -91,29 +97,38 @@ def _submit(data):
         return application
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class GoogleSheetsApplicationView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
 
     def post(self, request):
-        configured = settings.GOOGLE_SHEETS_WEBHOOK_SECRET
+        configured = settings.VENDOR_OPS_WEBHOOK_SECRET
         supplied = request.headers.get('X-Webhook-Secret', '')
         if not configured or not secrets.compare_digest(supplied, configured):
-            return Response({'detail': 'Unauthorized.'}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({'detail': 'Unauthorized'}, status=status.HTTP_401_UNAUTHORIZED)
         serializer = GoogleSheetsApplicationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         existing = GoogleSheetsSubmission.objects.filter(submission_id=data['submission_id']).first()
         if existing:
-            return Response({'status': 'already_received', 'application_id': str(existing.application_id)})
+            existing.sheet_type = data['sheet_type']
+            existing.sheet_name = data['sheet_name']
+            existing.row_number = data['row_number']
+            existing.raw_fields = data['raw_fields']
+            existing.save(update_fields=['sheet_type', 'sheet_name', 'row_number', 'raw_fields'])
+            return Response({'status': 'success', 'submission_id': data['submission_id']})
         try:
             with transaction.atomic():
                 application = _submit(data)
                 GoogleSheetsSubmission.objects.create(
-                    submission_id=data['submission_id'], sheet_type=data['sheet_type'], application=application,
+                    submission_id=data['submission_id'], sheet_type=data['sheet_type'],
+                    sheet_name=data['sheet_name'], row_number=data['row_number'], raw_fields=data['raw_fields'],
+                    application=application,
                 )
         except IntegrityError:
-            existing = GoogleSheetsSubmission.objects.get(submission_id=data['submission_id'])
-            return Response({'status': 'already_received', 'application_id': str(existing.application_id)})
+            return Response({'status': 'success', 'submission_id': data['submission_id']})
         logger.info('Google Sheets submission received: application %s', application.pk)
-        return Response({'status': 'received', 'application_id': str(application.pk)}, status=status.HTTP_201_CREATED)
+        return Response(
+            {'status': 'success', 'submission_id': data['submission_id']}, status=status.HTTP_201_CREATED,
+        )

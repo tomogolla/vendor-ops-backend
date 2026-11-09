@@ -2,7 +2,7 @@
 
 The authenticated endpoint is:
 
-`POST https://ops.thegoodflea.com/api/v1/public/google-sheets/applications/`
+`POST https://ops.thegoodflea.com/api/webhooks/vendor-interest/`
 
 It sends both form types through the normal application pipeline, including duplicate matching,
 application bundling, discovery-call tasks, activity history, and application email automation.
@@ -11,9 +11,9 @@ application bundling, discovery-call tasks, activity history, and application em
 
 In Apps Script, open **Project Settings → Script properties** and add:
 
-- `VENDOR_OPS_WEBHOOK_URL`: `https://ops.thegoodflea.com/api/v1/public/google-sheets/applications/`
+- `VENDOR_OPS_WEBHOOK_URL`: `https://ops.thegoodflea.com/api/webhooks/vendor-interest/`
 - `VENDOR_OPS_WEBHOOK_SECRET`: the same random value as the backend setting
-  `GOOGLE_SHEETS_WEBHOOK_SECRET`
+  `VENDOR_OPS_WEBHOOK_SECRET`
 
 Use an installable **From spreadsheet → On form submit** trigger for this function:
 
@@ -36,10 +36,16 @@ function onFormSubmitTrigger(e) {
   const namedValues = e.namedValues || {};
 
   function getValue(key) {
-    return namedValues[key] && namedValues[key][0]
-      ? namedValues[key][0].toString().trim()
+    const actualKey = Object.keys(namedValues).find(
+      candidate => candidate.trim().toLowerCase() === key.trim().toLowerCase()
+    );
+    return actualKey && namedValues[actualKey] && namedValues[actualKey][0]
+      ? namedValues[actualKey][0].toString().trim()
       : "";
   }
+
+  const rawFields = {};
+  Object.keys(namedValues).forEach(key => rawFields[key] = getValue(key));
 
   // Stable for this response row, so rerunning the trigger does not duplicate an application.
   const submissionId = [e.source.getId(), sheet.getSheetId(), e.range.getRow()].join(":");
@@ -49,23 +55,29 @@ function onFormSubmitTrigger(e) {
     payload = {
       submission_id: submissionId,
       sheet_type: "vendor_interest_form",
+      sheet_name: sheetName,
+      row_number: e.range.getRow(),
       first_name: getValue("First name"),
       business_name: getValue("Business name"),
       phone_number: getValue("Phone number"),
       instagram: getValue("Instagram"),
       email: getValue("email"),
       form_number: getValue("Form Number"),
-      date_applied: getValue("Date applied")
+      date_applied: getValue("Date applied"),
+      raw_fields: rawFields
     };
   } else if (sheetName === "popup form") {
     payload = {
       submission_id: submissionId,
       sheet_type: "popup_form",
+      sheet_name: sheetName,
+      row_number: e.range.getRow(),
       submission_date: getValue("submission_date"),
       first_name: getValue("first_name"),
       email: getValue("email"),
       brand_name: getValue("brand_name"),
-      phone_number: getValue("phone_number")
+      phone_number: getValue("phone_number"),
+      raw_fields: rawFields
     };
   } else {
     return;
@@ -90,6 +102,6 @@ function onFormSubmitTrigger(e) {
 ## Backend deployment
 
 Generate a secret locally with `python -c "import secrets; print(secrets.token_urlsafe(48))"`, add it
-as `GOOGLE_SHEETS_WEBHOOK_SECRET` in `/etc/vendor-ops/backend.env`, deploy the backend (which runs the
+as `VENDOR_OPS_WEBHOOK_SECRET` in `/etc/vendor-ops/backend.env`, deploy the backend (which runs the
 new migration), and put the same value in Apps Script properties. Never put it directly in the
 script or commit it.
