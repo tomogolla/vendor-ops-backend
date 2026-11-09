@@ -6,6 +6,7 @@ from accounts.views import CsrfView, LoginView, LogoutView, MeView, TeamView, Us
 from catalog.views import MarketWeekendViewSet
 from communications.views import EmailMessageViewSet, EmailOverviewView, EmailSettingsView, EmailTemplateViewSet
 from imports.views import ImportConfirmView, ImportPreviewView
+from public_api.sheets import GoogleSheetsApplicationView
 from tasks.views import TaskViewSet
 from vendors.views import ApplicationLineViewSet, ApplicationViewSet, HealthView, VendorViewSet
 
@@ -39,5 +40,6 @@ api_v1 = [
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('api/webhooks/vendor-interest/', GoogleSheetsApplicationView.as_view(), name='vendor-interest-webhook'),
     path('api/v1/', include(api_v1)),
 ]

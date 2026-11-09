@@ -7,7 +7,7 @@ from public_api.models import GoogleSheetsSubmission
 from tasks.models import Task
 from vendors.models import Application, LeadIntakeEvent, Vendor
 
-URL = '/api/v1/public/google-sheets/applications/'
+URL = '/api/webhooks/vendor-interest/'
 SECRET = 'test-google-sheets-secret'
 
 
@@ -15,6 +15,8 @@ def vendor_payload(**overrides):
     data = {
         'submission_id': 'spreadsheet:Vendor Interest Form:42',
         'sheet_type': 'vendor_interest_form',
+        'sheet_name': 'Vendor Interest Form',
+        'row_number': 14,
         'first_name': 'Ana',
         'business_name': 'Juniper Goods',
         'phone_number': '(555) 123-4567',
@@ -22,12 +24,13 @@ def vendor_payload(**overrides):
         'email': 'Ana@Example.com',
         'form_number': 'V-42',
         'date_applied': '2026-11-09',
+        'raw_fields': {'First name': 'Ana', 'Unmapped question': 'Extra answer'},
     }
     data.update(overrides)
     return data
 
 
-@override_settings(GOOGLE_SHEETS_WEBHOOK_SECRET=SECRET)
+@override_settings(VENDOR_OPS_WEBHOOK_SECRET=SECRET)
 class GoogleSheetsWebhookTests(ApiTestCase):
     def setUp(self):
         self.client = APIClient(enforce_csrf_checks=True)
@@ -37,7 +40,7 @@ class GoogleSheetsWebhookTests(ApiTestCase):
 
     def test_requires_configured_matching_secret(self):
         self.assertEqual(self.post(vendor_payload(), secret='wrong').status_code, 401)
-        with override_settings(GOOGLE_SHEETS_WEBHOOK_SECRET=''):
+        with override_settings(VENDOR_OPS_WEBHOOK_SECRET=''):
             self.assertEqual(self.post(vendor_payload()).status_code, 401)
         self.assertFalse(Application.objects.exists())
 
@@ -54,6 +57,9 @@ class GoogleSheetsWebhookTests(ApiTestCase):
         self.assertEqual(EmailMessage.objects.filter(application=application, template_key='application_received').count(), 1)
         event = LeadIntakeEvent.objects.get()
         self.assertEqual((event.metadata['form_number'], event.metadata['date_applied']), ('V-42', '2026-11-09'))
+        receipt = GoogleSheetsSubmission.objects.get()
+        self.assertEqual((receipt.sheet_name, receipt.row_number), ('Vendor Interest Form', 14))
+        self.assertEqual(receipt.raw_fields['Unmapped question'], 'Extra answer')
 
     def test_popup_form_maps_brand_and_is_idempotent(self):
         data = {
@@ -64,7 +70,7 @@ class GoogleSheetsWebhookTests(ApiTestCase):
         first = self.post(data)
         second = self.post(data)
         self.assertEqual((first.status_code, second.status_code), (201, 200))
-        self.assertEqual(second.json()['status'], 'already_received')
+        self.assertEqual(second.json(), {'status': 'success', 'submission_id': data['submission_id']})
         self.assertEqual((Vendor.objects.count(), Application.objects.count(), GoogleSheetsSubmission.objects.count()), (1, 1, 1))
         self.assertEqual(LeadIntakeEvent.objects.get().metadata['submission_date'], '2026-11-09 10:15')
 
