@@ -41,6 +41,7 @@ env = environ.Env(
     PUBLIC_APPLICATIONS_ENABLED=(bool, False),
     PUBLIC_APPLICATION_CONSENT_VERSION=(str, '2026-10'),
     PUBLIC_APPLICATIONS_DAILY_CAP=(int, 200),
+    GOOGLE_SHEETS_WEBHOOK_SECRET=(str, ''),
     TURNSTILE_SECRET_KEY=(str, ''),
     TURNSTILE_EXPECTED_HOSTNAMES=(list, []),
     TURNSTILE_EXPECTED_HOSTNAME=(str, ''),  # single-host spelling, accepted as well
@@ -194,6 +195,9 @@ PUBLIC_APPLICATION_CONSENT_VERSION = env('PUBLIC_APPLICATION_CONSENT_VERSION')
 # Website-form applications created per day (business time zone); more answer 503.
 PUBLIC_APPLICATIONS_DAILY_CAP = env('PUBLIC_APPLICATIONS_DAILY_CAP')
 PUBLIC_APPLICATIONS_EMAIL_LIMIT_PER_DAY = 3
+# Shared secret used by the server-to-server Google Sheets intake webhook. The endpoint refuses
+# every request while this is empty.
+GOOGLE_SHEETS_WEBHOOK_SECRET = env('GOOGLE_SHEETS_WEBHOOK_SECRET')
 # Cloudflare Turnstile secret (server environment only). Without it no submission is accepted, in
 # any environment; local development uses Cloudflare's test secret. A verified token must also come
 # from one of these hostnames and carry this action (the page renders the widget with it).
